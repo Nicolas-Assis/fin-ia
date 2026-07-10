@@ -12,6 +12,29 @@ app.onError((err, c) =>
 
 app.get("/health", (c) => c.json({ ok: true }));
 
+// Relatório HTML hospedado — aberto pelo botão "Abrir relatório" no Telegram.
+// A chave `k` é a chave pessoal (shortcutKey) do usuário, que identifica e autoriza.
+// GET /api/report?k=<chave-pessoal>&period=<mes|semana|hoje|AAAA-MM>
+app.get("/report", async (c) => {
+  const { resolveUserByShortcutKey } = await import("./users.js");
+  const user = await resolveUserByShortcutKey(c.req.query("k") || "");
+  if (!user) return c.text("unauthorized", 401);
+
+  const [{ collectReportData }, { buildHtmlReport }, { summarize }] =
+    await Promise.all([
+      import("./report.js"),
+      import("./html-report.js"),
+      import("./llm.js"),
+    ]);
+  const data = await collectReportData(
+    user.id,
+    user.name,
+    c.req.query("period") || undefined,
+  );
+  const resumo = data.countTx > 0 ? await summarize(data) : "";
+  return c.html(buildHtmlReport(data, resumo));
+});
+
 app.post("/shortcut", async (c) => {
   const { handleShortcut } = await import("./shortcut.js");
   return handleShortcut(c);
@@ -29,8 +52,11 @@ app.get("/shortcut", async (c) => {
     );
   }
   try {
-    const { listAccountNames } = await import("./transactions.js");
-    const contas = await listAccountNames();
+    const { prisma } = await import("./db.js");
+    const [usuarios, contas] = await Promise.all([
+      prisma.user.count(),
+      prisma.account.count(),
+    ]);
     return c.json({
       env: {
         SHORTCUT_API_KEY: process.env.SHORTCUT_API_KEY
@@ -41,9 +67,9 @@ app.get("/shortcut", async (c) => {
           ? "✅ definida"
           : "❌ AUSENTE",
       },
-      contas,
+      totais: { usuarios, contas },
       instrucoes: {
-        header_obrigatorio: "x-api-key: <valor de SHORTCUT_API_KEY>",
+        header_obrigatorio: "x-api-key: <chave pessoal do usuário (veja /atalho no bot)>",
         body_texto: '{ "texto": "gastei 45 no posto no nubank" }',
         body_estruturado:
           '{ "tipo": "saida", "valor": 45, "conta": "Nubank", "descricao": "posto" }',

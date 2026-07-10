@@ -1,15 +1,19 @@
 import { prisma } from "./db.js";
 
-export async function listAccounts() {
-  return prisma.account.findMany({ orderBy: { name: "asc" } });
+export async function listAccounts(userId: string) {
+  return prisma.account.findMany({ where: { userId }, orderBy: { name: "asc" } });
 }
 
-export async function listAccountNames(): Promise<string[]> {
-  const accs = await prisma.account.findMany({ select: { name: true } });
+export async function listAccountNames(userId: string): Promise<string[]> {
+  const accs = await prisma.account.findMany({
+    where: { userId },
+    select: { name: true },
+  });
   return accs.map((a) => a.name);
 }
 
 export async function addAccount(input: {
+  userId: string;
   name: string;
   type?: string;
   currency?: string;
@@ -17,6 +21,7 @@ export async function addAccount(input: {
 }) {
   return prisma.account.create({
     data: {
+      userId: input.userId,
       name: input.name,
       type: input.type || "corrente",
       currency: input.currency || "BRL",
@@ -25,9 +30,9 @@ export async function addAccount(input: {
   });
 }
 
-/** Tenta casar um "hint" de conta (ex: "nubank") com uma conta cadastrada. */
-export async function resolveAccount(hint: string | null) {
-  const accs = await prisma.account.findMany();
+/** Tenta casar um "hint" de conta (ex: "nubank") com uma conta DO usuário. */
+export async function resolveAccount(userId: string, hint: string | null) {
+  const accs = await prisma.account.findMany({ where: { userId } });
   if (accs.length === 0) return null;
   if (!hint) return accs.length === 1 ? accs[0] : null;
   const h = hint.toLowerCase().trim();
@@ -73,8 +78,11 @@ export interface BalanceRow {
   balance: number;
 }
 
-export async function balances(): Promise<BalanceRow[]> {
-  const accs = await prisma.account.findMany({ orderBy: { name: "asc" } });
+export async function balances(userId: string): Promise<BalanceRow[]> {
+  const accs = await prisma.account.findMany({
+    where: { userId },
+    orderBy: { name: "asc" },
+  });
   const rows: BalanceRow[] = [];
   for (const a of accs) {
     const agg = await prisma.transaction.groupBy({

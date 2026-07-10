@@ -8,14 +8,32 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+// Pessoa autorizada a usar o bot. Cada usuário tem suas PRÓPRIAS contas e
+// lançamentos (dados 100% isolados entre pessoas).
+model User {
+  id           String        @id @default(cuid())
+  telegramId   String        @unique // chat id do Telegram
+  name         String        @default("")
+  role         String        @default("member") // owner | member
+  active       Boolean       @default(true)
+  shortcutKey  String        @unique @default(cuid()) // chave pessoal p/ Atalho iOS + link do relatório
+  accounts     Account[]
+  createdAt    DateTime      @default(now())
+}
+
 model Account {
   id             String        @id @default(cuid())
-  name           String        @unique
+  // Opcional para permitir a migração sem perder dados; a aplicação sempre define.
+  user           User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String?
+  name           String
   type           String        @default("corrente") // corrente | poupanca | cartao | dinheiro | cripto
   currency       String        @default("BRL")
   initialBalance Decimal       @default(0) @db.Decimal(14, 2)
   transactions   Transaction[]
   createdAt      DateTime      @default(now())
+
+  @@unique([userId, name]) // nome único por pessoa
 }
 
 model Transaction {

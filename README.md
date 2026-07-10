@@ -77,7 +77,7 @@ Crie um atalho novo com estas ações (versão estruturada — mais confiável):
 5. **Obter conteúdo de URL**:
    - URL: `https://seu-app.vercel.app/api/shortcut`
    - Método: **POST**
-   - Cabeçalhos: `x-api-key` = *(o valor de `SHORTCUT_API_KEY`)*
+   - Cabeçalhos: `x-api-key` = *(sua **chave pessoal** — mande `/atalho` no bot para pegá-la)*
    - Corpo da solicitação: **JSON**
      ```json
      {
@@ -98,17 +98,51 @@ Para aparecer a janela "toda vez que faz uma ação", adicione o atalho à
 
 ---
 
+---
+
+## 7. Compartilhar com a família 👨‍👩‍👧 (multiusuário)
+
+Cada pessoa tem as **próprias contas e lançamentos, totalmente isolados** (ninguém vê os dados do outro). Você (`TELEGRAM_CHAT_ID`) é o **dono/admin**.
+
+1. A pessoa manda qualquer mensagem pro bot → recebe um **código** (o chat id dela).
+2. Você libera: `/convidar <código> <nome>` — ex: `/convidar 123456789 Mãe`.
+3. Pronto: ela manda `/start`, cria as contas dela (`/addconta`) e usa tudo.
+4. Cada um pega a **própria chave** do Atalho do iOS com `/atalho`.
+
+Admin: `/pessoas` (lista quem tem acesso) · `/remover <código>` (bloqueia o acesso, sem apagar os dados).
+
+> **Migração:** ao rodar `npm run db:push` num projeto que já tinha dados, as contas antigas viram automaticamente do dono na primeira vez que ele mandar `/start` (ou ao rodar `npm run seed`).
+
+---
+
 ## Endpoints
-- `POST /api/shortcut` — header `x-api-key`; body estruturado **ou** `{ "texto": "..." }`.
+- `POST /api/shortcut` — header `x-api-key` (**chave pessoal**, via `/atalho`); body estruturado **ou** `{ "texto": "..." }`.
 - `POST /api/telegram?secret=...` — webhook do Telegram.
+- `GET /api/report?k=<chave-pessoal>&period=<mes|semana|hoje|AAAA-MM>` — relatório **HTML** online do dono da chave (aberto pelo botão no chat).
 - `GET /api/health` — status.
 
 ## Comandos do bot
 - texto livre → registrar lançamento (com confirmação)
+- `/menu` — menu principal com **botões** (tudo a um toque)
+
+**Relatórios**
+- `/relatorio [hoje|semana|mes|AAAA-MM]` — relatório **visual em HTML** (gráficos de barras/donut, KPIs, extrato) enviado como arquivo **+ botão para abrir online**.
+- `/planilha [período]` — exporta em Excel (`.xlsx`).
+- `/resumo [período]` — resumo rápido no chat (KPIs + maiores categorias + análise da IA).
+- `/categorias [período]` — gastos por categoria com barras.
+- `/hoje` — lançamentos do dia · `/extrato [n]` — últimos lançamentos.
+
+**Contas & integração**
 - `/saldo` · `/contas` · `/addconta Nome | tipo | moeda | saldoInicial`
-- `/relatorio [mes|semana|AAAA-MM]` · `/desfazer`
+- `/atalho` — sua chave pessoal + link do relatório · `/desfazer` · `/menu` · `/ajuda`
+
+**Dono (admin)**
+- `/pessoas` · `/convidar <id> <nome>` · `/remover <id>`
+
+> O relatório HTML é **autocontido** (CSS e gráficos SVG inline, sem dependências externas),
+> tem tema claro/escuro automático e fica ótimo no navegador, no celular e na impressão.
 
 ## Notas
 - Como a Vercel é serverless, a confirmação usa uma tabela `Pending` (não memória).
 - Dinheiro é `Decimal(14,2)`; saldo = inicial + entradas − saídas.
-- Só o `TELEGRAM_CHAT_ID` configurado consegue usar o bot.
+- **Multiusuário isolado**: dados por pessoa; o `TELEGRAM_CHAT_ID` é o dono e autoriza os demais.

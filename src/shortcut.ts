@@ -5,6 +5,7 @@ import {
   listAccountNames,
   resolveAccount,
 } from "./transactions.js";
+import { resolveUserForShortcut } from "./users.js";
 
 /**
  * POST /api/shortcut
@@ -16,7 +17,7 @@ import {
 export async function handleShortcut(c: Context) {
   const key = c.req.header("x-api-key");
 
-  // ── Auth ──────────────────────────────────────────────────────────────────
+  // ── Auth (chave pessoal identifica QUEM está lançando) ──────────────────────
   if (!key) {
     console.warn("[shortcut] 401 – header x-api-key ausente");
     return c.json(
@@ -24,13 +25,18 @@ export async function handleShortcut(c: Context) {
       401,
     );
   }
-  if (key !== process.env.SHORTCUT_API_KEY) {
-    console.warn("[shortcut] 401 – x-api-key incorreto:", key);
+  const user = await resolveUserForShortcut(key);
+  if (!user) {
+    console.warn("[shortcut] 401 – x-api-key não corresponde a nenhum usuário ativo");
     return c.json(
-      { error: "unauthorized", detail: "x-api-key incorreto" },
+      {
+        error: "unauthorized",
+        detail: "x-api-key inválida. Pegue sua chave pessoal com /atalho no bot.",
+      },
       401,
     );
   }
+  console.log("[shortcut] usuário:", user.name || user.telegramId);
 
   // ── Body ──────────────────────────────────────────────────────────────────
   let body: any;
@@ -43,8 +49,8 @@ export async function handleShortcut(c: Context) {
   console.log("[shortcut] body recebido:", JSON.stringify(body));
 
   // ── Contas ────────────────────────────────────────────────────────────────
-  const contas = await listAccountNames();
-  console.log("[shortcut] contas no banco:", contas);
+  const contas = await listAccountNames(user.id);
+  console.log("[shortcut] contas do usuário:", contas);
   if (contas.length === 0) {
     console.warn("[shortcut] 422 – nenhuma conta cadastrada");
     return c.json(
@@ -173,7 +179,7 @@ export async function handleShortcut(c: Context) {
     );
   }
 
-  const acc = await resolveAccount(contaHint);
+  const acc = await resolveAccount(user.id, contaHint);
   console.log(
     "[shortcut] conta resolvida:",
     acc?.name ?? null,
