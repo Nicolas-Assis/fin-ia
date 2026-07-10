@@ -17,8 +17,17 @@ app.post("/shortcut", async (c) => {
   return handleShortcut(c);
 });
 
-// Debug: GET /api/shortcut/debug — mostra estado das env vars e contas cadastradas
-app.get("/shortcut/debug", async (c) => {
+// Debug: GET /api/shortcut?debug=1 — mostra estado das env vars e contas cadastradas
+app.get("/shortcut", async (c) => {
+  if (c.req.query("debug") !== "1") {
+    return c.json(
+      {
+        error:
+          "use POST para enviar lançamentos. Para debug: GET /api/shortcut?debug=1",
+      },
+      405,
+    );
+  }
   try {
     const { listAccountNames } = await import("./transactions.js");
     const contas = await listAccountNames();
