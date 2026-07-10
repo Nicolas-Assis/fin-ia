@@ -1,0 +1,9 @@
+{
+  "outputDirectory": ".",
+  "buildCommand": "npx prisma generate",
+  "functions": {
+    "api/[[...route]].ts": {
+      "maxDuration": 30
+    }
+  }
+}

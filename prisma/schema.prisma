@@ -1,0 +1,45 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Account {
+  id             String        @id @default(cuid())
+  name           String        @unique
+  type           String        @default("corrente") // corrente | poupanca | cartao | dinheiro | cripto
+  currency       String        @default("BRL")
+  initialBalance Decimal       @default(0) @db.Decimal(14, 2)
+  transactions   Transaction[]
+  createdAt      DateTime      @default(now())
+}
+
+model Transaction {
+  id          String   @id @default(cuid())
+  account     Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId   String
+  type        String // entrada | saida
+  amount      Decimal  @db.Decimal(14, 2)
+  currency    String   @default("BRL")
+  category    String   @default("Outros")
+  description String   @default("")
+  occurredAt  DateTime @default(now())
+  source      String   @default("telegram") // telegram | shortcut
+  rawInput    String   @default("")
+  createdAt   DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([accountId])
+}
+
+// Lançamento aguardando confirmação no Telegram (serverless = estado no banco)
+model Pending {
+  id        String   @id @default(cuid())
+  chatId    String
+  payload   Json
+  createdAt DateTime @default(now())
+}
