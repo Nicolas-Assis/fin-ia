@@ -83,7 +83,8 @@ bot.command("resumo", (ctx) => viewResumo(ctx, ctx.user, ctx.match));
 bot.command("hoje", (ctx) => viewHoje(ctx, ctx.user));
 bot.command("categorias", (ctx) => viewCategorias(ctx, ctx.user, ctx.match));
 bot.command("extrato", (ctx) => viewExtrato(ctx, ctx.user, ctx.match));
-bot.command(["atalho", "chave", "apikey"], (ctx) => viewAtalho(ctx, ctx.user));
+bot.command(["atalho", "apikey"], (ctx) => viewAtalho(ctx, ctx.user));
+bot.command(["minhachave", "chave"], (ctx) => viewChave(ctx, ctx.user));
 
 bot.command("addconta", async (ctx) => {
   const args = (ctx.match || "").split("|").map((s) => s.trim());
@@ -373,6 +374,10 @@ bot.callbackQuery("m:atalho", async (ctx) => {
   await ctx.answerCallbackQuery();
   await viewAtalho(ctx, ctx.user);
 });
+bot.callbackQuery("m:chave", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await viewChave(ctx, ctx.user);
+});
 bot.callbackQuery("m:novaconta", async (ctx) => {
   await ctx.answerCallbackQuery();
   await ctx.reply(
@@ -541,20 +546,55 @@ async function viewExtrato(ctx: Ctx, user: DbUser, arg?: string) {
   );
 }
 
+async function viewChave(ctx: Ctx, user: DbUser) {
+  await ctx.reply(
+    `🔑 *Sua chave pessoal do Fin AI*\n\n` +
+      `\`${user.shortcutKey}\`\n\n` +
+      `👆 Toque na chave para copiar.\n` +
+      `Cole no campo *x-api-key* do seu atalho do iOS. 🔒 Não compartilhe — é só sua.`,
+    { parse_mode: "Markdown" },
+  );
+}
+
 async function viewAtalho(ctx: Ctx, user: DbUser) {
   const base = process.env.APP_URL?.replace(/\/$/, "") || "https://seu-app.vercel.app";
   const link = reportUrl(user, "mes");
-  await ctx.reply(
-    `📲 *Seu Atalho do iOS / integração*\n\n` +
-      `Sua chave pessoal (não compartilhe):\n\`${user.shortcutKey}\`\n\n` +
-      `*Como usar no app Atalhos:*\n` +
-      `• URL: \`${base}/api/shortcut\`\n` +
-      `• Método: POST\n` +
-      `• Cabeçalho: \`x-api-key\` = _sua chave acima_\n` +
-      `• Corpo (JSON): \`{ "texto": "gastei 45 no posto" }\`\n\n` +
-      (link ? `🌐 Link do seu relatório:\n${link}` : ""),
-    { parse_mode: "Markdown" },
-  );
+  const template = process.env.SHORTCUT_TEMPLATE_URL; // link iCloud do atalho pronto (opcional)
+
+  const kb = new InlineKeyboard();
+  if (template) kb.url("📲 Instalar o atalho no iPhone", template).row();
+  if (link) kb.url("🌐 Abrir meu relatório", link).row();
+  kb.text("🔑 Copiar minha chave", "m:chave");
+
+  const linhas = [
+    "📲 *Integração / Atalho do iOS*",
+    "",
+    "*Sua chave pessoal* (não compartilhe):",
+    "`" + user.shortcutKey + "`",
+    "",
+  ];
+  if (template) {
+    linhas.push(
+      "*Como colocar no iPhone:*",
+      "1️⃣ Toque em *Instalar o atalho* aqui embaixo.",
+      "2️⃣ Dentro do atalho, na ação _Obter conteúdo de URL_ → cabeçalho `x-api-key`, cole a *sua chave* acima.",
+      "3️⃣ Pronto! Rode o atalho e fale/escreva o gasto.",
+    );
+  } else {
+    linhas.push(
+      "*Monte um atalho* com a ação _Obter conteúdo de URL_:",
+      "• URL: `" + base + "/api/shortcut`",
+      "• Método: POST",
+      "• Cabeçalho `x-api-key`: _sua chave acima_",
+      '• Corpo (JSON): `{ "texto": "gastei 45 no posto" }`',
+      "",
+      "_(A URL acima é só o endereço de envio — não abre nada se você tocar nela.)_",
+    );
+  }
+  await ctx.reply(linhas.join("\n"), {
+    parse_mode: "Markdown",
+    reply_markup: kb,
+  });
 }
 
 async function viewPessoas(ctx: Ctx, user: DbUser) {

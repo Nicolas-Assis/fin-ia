@@ -96,7 +96,12 @@ Crie um atalho novo com estas ações (versão estruturada — mais confiável):
 Para aparecer a janela "toda vez que faz uma ação", adicione o atalho à
 **Tela de Início** ou a um **widget/Automação** no app Atalhos.
 
----
+### Compartilhar o atalho com a família
+O atalho é **o mesmo pra todos** — o que diferencia cada pessoa é a **chave pessoal**
+(pegue com `/atalho`) colada no cabeçalho `x-api-key`. Publique seu atalho
+(Compartilhar → **Copiar link do iCloud**) e coloque o link em `SHORTCUT_TEMPLATE_URL`;
+aí o comando `/atalho` passa a mostrar o botão **📲 Instalar o atalho no iPhone**.
+Cada pessoa instala o mesmo atalho e cola **a própria chave**.
 
 ---
 
