@@ -137,8 +137,23 @@ bot.command("convidar", async (ctx) => {
     );
   }
   const u = await inviteUser(tgId, nome);
+
+  // Tenta avisar a pessoa aqui mesmo no Telegram (só funciona se ela já abriu o bot).
+  let aviso: string;
+  try {
+    await ctx.api.sendMessage(
+      tgId,
+      `🎉 Você foi liberado(a) no *Fin AI*!\n\nMande /start para começar. Suas finanças ficam *separadas e privadas* — só você vê.`,
+      { parse_mode: "Markdown" },
+    );
+    aviso = "📨 Já avisei a pessoa aqui no Telegram.";
+  } catch {
+    aviso =
+      "⚠️ Não consegui avisar automaticamente (a pessoa precisa ter aberto o bot ao menos uma vez). Peça pra ela mandar /start.";
+  }
+
   await ctx.reply(
-    `✅ *${mdEsc(u.name || tgId)}* autorizado(a)!\nPeça pra pessoa mandar /start no bot. Ela terá as próprias contas e dados, separados dos seus.`,
+    `✅ *${mdEsc(u.name || tgId)}* autorizado(a)!\n${aviso}`,
     { parse_mode: "Markdown" },
   );
 });
@@ -164,9 +179,25 @@ bot.command("pessoas", (ctx) => viewPessoas(ctx, ctx.user));
 
 // -------------------- Texto livre → confirmação --------------------
 
+const KNOWN_COMMANDS =
+  /^\/(convidar|remover|addconta|relatorio|planilha|resumo|categorias|extrato|saldo|contas|hoje|atalho|chave|apikey|menu|ajuda|help|desfazer|pessoas|start)\b/i;
+
 bot.on("message:text", async (ctx) => {
   const texto = ctx.message.text;
   if (texto.startsWith("/")) return; // comando não reconhecido
+
+  // Erro comum: mandar "Convidar /convidar ..." (texto ANTES do comando).
+  // Nesse caso o Telegram não executa o comando; então damos a dica certinha.
+  const slashIdx = texto.indexOf("/");
+  if (slashIdx > 0) {
+    const rest = texto.slice(slashIdx).trim();
+    if (KNOWN_COMMANDS.test(rest)) {
+      return ctx.reply(
+        `👉 Para usar um comando, a mensagem precisa *começar* com "/", sem nada antes. Tente:\n\`${rest}\``,
+        { parse_mode: "Markdown" },
+      );
+    }
+  }
 
   const accs = await listAccounts(ctx.user.id);
   if (accs.length === 0) {
@@ -181,6 +212,14 @@ bot.on("message:text", async (ctx) => {
     parsed = await parseTransaction(texto, accs.map((a) => a.name));
   } catch (e: any) {
     return ctx.reply(`❌ Não entendi o lançamento. (${e?.message ?? e})`);
+  }
+
+  // Não registra lançamento sem valor — evita "Saída R$ 0,00" de frases que não são gastos.
+  if (!parsed.valor || parsed.valor <= 0) {
+    return ctx.reply(
+      "🤔 Não identifiquei um valor válido nesse lançamento.\nEx: `gastei 45 no posto no nubank`",
+      { parse_mode: "Markdown" },
+    );
   }
 
   const acc = await resolveAccount(ctx.user.id, parsed.conta);
