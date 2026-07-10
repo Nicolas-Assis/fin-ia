@@ -83,31 +83,74 @@ export async function handleShortcut(c: Context) {
     }
   } else {
     tipo = body.tipo === "entrada" ? "entrada" : "saida";
-    valor = Math.abs(Number(String(body.valor ?? "").replace(",", "."))) || 0;
-    contaHint = body.conta ?? null;
-    descricao = body.descricao ?? "";
-    console.log(
-      "[shortcut] modo estruturado – tipo:",
-      tipo,
-      "valor:",
-      valor,
-      "conta:",
-      contaHint,
-      "descricao:",
-      descricao,
-    );
-    if (descricao) {
+    // Aceita: valor, value, amount, quantia
+    const rawValor =
+      body.valor ?? body.value ?? body.amount ?? body.quantia ?? "";
+    valor = Math.abs(Number(String(rawValor).replace(",", "."))) || 0;
+    // Aceita: conta, account, cartao
+    contaHint = body.conta ?? body.account ?? body.cartao ?? null;
+    descricao = body.descricao ?? body.description ?? body.desc ?? "";
+
+    // Fallback: se valor não é número válido (ex: iOS mandou o texto da variável errado),
+    // monta um texto e deixa o LLM parsear tudo.
+    if (!valor || valor <= 0) {
+      const textoFallback =
+        [
+          body.tipo && !/^(entrada|saida)$/i.test(body.tipo) ? body.tipo : null,
+          descricao || null,
+          contaHint ? `no ${contaHint}` : null,
+        ]
+          .filter(Boolean)
+          .join(" ") || JSON.stringify(body);
+
+      console.warn(
+        "[shortcut] valor inválido no modo estruturado, tentando LLM com:",
+        textoFallback,
+      );
       try {
-        const p = await parseTransaction(
-          `${tipo} ${valor} ${descricao}`,
-          contas,
-        );
+        const p = await parseTransaction(textoFallback, contas);
+        tipo = p.tipo;
+        valor = p.valor;
+        contaHint = p.conta ?? contaHint;
         categoria = p.categoria;
-      } catch {
-        categoria = "Outros";
+        descricao = p.descricao;
+        console.log("[shortcut] LLM fallback parseou:", JSON.stringify(p));
+      } catch (e: any) {
+        console.error("[shortcut] LLM fallback falhou:", e?.message);
+        return c.json(
+          {
+            error:
+              "valor inválido e não foi possível interpretar automaticamente",
+            body_recebido: body,
+            dica: 'Envie { "valor": 45.90 } com número, ou use { "texto": "gastei 45 no posto" }',
+          },
+          422,
+        );
       }
     } else {
-      categoria = body.categoria ?? "Outros";
+      console.log(
+        "[shortcut] modo estruturado – tipo:",
+        tipo,
+        "valor:",
+        valor,
+        "conta:",
+        contaHint,
+        "descricao:",
+        descricao,
+      );
+      if (descricao) {
+        try {
+          const p = await parseTransaction(
+            `${tipo} ${valor} ${descricao}`,
+            contas,
+          );
+          categoria = p.categoria;
+        } catch {
+          categoria = "Outros";
+        }
+      } else {
+        categoria = body.categoria ?? "Outros";
+      }
     }
   }
 
@@ -122,7 +165,9 @@ export async function handleShortcut(c: Context) {
     return c.json(
       {
         error: "valor inválido",
-        detail: `valor recebido: ${body.valor} → parseado: ${valor}`,
+        detail: `valor recebido: ${body.valor ?? body.value ?? body.amount ?? "(campo não encontrado)"} → parseado: ${valor}`,
+        body_recebido: body,
+        dica: "Envie o campo 'valor' com número positivo. Ex: { \"valor\": 45.90 }",
       },
       422,
     );
