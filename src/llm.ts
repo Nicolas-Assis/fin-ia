@@ -33,7 +33,7 @@ async function chat(
   if (!res.ok) {
     throw new Error(`OpenRouter ${res.status}: ${await res.text()}`);
   }
-  const data = await res.json();
+  const data = (await res.json()) as any;
   return data?.choices?.[0]?.message?.content ?? "";
 }
 
