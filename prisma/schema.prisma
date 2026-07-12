@@ -51,7 +51,7 @@ model Transaction {
   createdAt   DateTime @default(now())
 
   @@index([occurredAt])
-  @@index([accountId])
+  @@index([accountId, occurredAt])
 }
 
 // Lançamento aguardando confirmação no Telegram (serverless = estado no banco)
@@ -60,4 +60,25 @@ model Pending {
   chatId    String
   payload   Json
   createdAt DateTime @default(now())
+
+  @@index([chatId])
+  @@index([createdAt])
+}
+
+// Cache chave-valor (resumos da IA etc.) — serverless não tem memória entre invocações.
+model Kv {
+  key       String   @id
+  value     String
+  expiresAt DateTime
+}
+
+// Meta de gasto mensal por categoria.
+model Budget {
+  id        String   @id @default(cuid())
+  userId    String
+  category  String
+  amount    Decimal  @db.Decimal(14, 2) // teto mensal
+  createdAt DateTime @default(now())
+
+  @@unique([userId, category])
 }

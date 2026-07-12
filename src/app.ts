@@ -5,16 +5,21 @@ import { Hono } from "hono";
 // ausente (new Bot("") lança "Empty token!") ou um erro de DB não derruba a função inteira.
 export const app = new Hono().basePath("/api");
 
-// Erros de rota viram JSON com a mensagem real — ajuda a diagnosticar env faltando na Vercel.
-app.onError((err, c) =>
-  c.json({ error: "route_failed", message: err.message }, 500),
-);
+const isProd = process.env.VERCEL_ENV === "production";
+
+// Erros de rota viram JSON. Em produção não vaza a mensagem interna.
+app.onError((err, c) => {
+  console.error("[route_failed]", err);
+  return c.json(
+    { error: "route_failed", ...(isProd ? {} : { message: err.message }) },
+    500,
+  );
+});
 
 app.get("/health", (c) => c.json({ ok: true }));
 
 // Relatório HTML hospedado — aberto pelo botão "Abrir relatório" no Telegram.
 // A chave `k` é a chave pessoal (shortcutKey) do usuário, que identifica e autoriza.
-// GET /api/report?k=<chave-pessoal>&period=<mes|semana|hoje|AAAA-MM>
 app.get("/report", async (c) => {
   const { resolveUserByShortcutKey } = await import("./users.js");
   const user = await resolveUserByShortcutKey(c.req.query("k") || "");
@@ -31,7 +36,7 @@ app.get("/report", async (c) => {
     user.name,
     c.req.query("period") || undefined,
   );
-  const resumo = data.countTx > 0 ? await summarize(data) : "";
+  const resumo = data.countTx > 0 ? await summarize(user.id, data) : "";
   return c.html(buildHtmlReport(data, resumo));
 });
 
@@ -40,16 +45,19 @@ app.post("/shortcut", async (c) => {
   return handleShortcut(c);
 });
 
-// Debug: GET /api/shortcut?debug=1 — mostra estado das env vars e contas cadastradas
+// Debug: GET /api/shortcut?debug=1 — SÓ para o dono (x-api-key), sem vazar env/contagens a estranhos.
 app.get("/shortcut", async (c) => {
   if (c.req.query("debug") !== "1") {
     return c.json(
-      {
-        error:
-          "use POST para enviar lançamentos. Para debug: GET /api/shortcut?debug=1",
-      },
+      { error: "use POST para enviar lançamentos. Para debug: GET /api/shortcut?debug=1 (requer x-api-key do dono)" },
       405,
     );
+  }
+  const { resolveUserForShortcut } = await import("./users.js");
+  const key = c.req.header("x-api-key") || c.req.query("k") || "";
+  const user = await resolveUserForShortcut(key);
+  if (!user || user.role !== "owner") {
+    return c.json({ error: "unauthorized" }, 401);
   }
   try {
     const { prisma } = await import("./db.js");
@@ -59,25 +67,28 @@ app.get("/shortcut", async (c) => {
     ]);
     return c.json({
       env: {
-        SHORTCUT_API_KEY: process.env.SHORTCUT_API_KEY
-          ? `✅ definida (${process.env.SHORTCUT_API_KEY.length} chars)`
-          : "❌ AUSENTE",
+        SHORTCUT_API_KEY: process.env.SHORTCUT_API_KEY ? "✅ definida" : "❌ AUSENTE",
         DATABASE_URL: process.env.DATABASE_URL ? "✅ definida" : "❌ AUSENTE",
-        TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN
-          ? "✅ definida"
-          : "❌ AUSENTE",
+        TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN ? "✅ definida" : "❌ AUSENTE",
+        OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY ? "✅ definida" : "❌ AUSENTE",
       },
       totais: { usuarios, contas },
-      instrucoes: {
-        header_obrigatorio: "x-api-key: <chave pessoal do usuário (veja /atalho no bot)>",
-        body_texto: '{ "texto": "gastei 45 no posto no nubank" }',
-        body_estruturado:
-          '{ "tipo": "saida", "valor": 45, "conta": "Nubank", "descricao": "posto" }',
-      },
     });
   } catch (e: any) {
-    return c.json({ error: e?.message, stack: e?.stack }, 500);
+    return c.json({ error: isProd ? "debug_failed" : e?.message }, 500);
   }
+});
+
+// Cron diário (Vercel Cron → resumo proativo). Protegido pelo CRON_SECRET.
+app.get("/cron/digest", async (c) => {
+  const auth = c.req.header("authorization") || "";
+  const secret = process.env.CRON_SECRET;
+  if (!secret || auth !== `Bearer ${secret}`) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const { runDailyDigest } = await import("./digest.js");
+  const result = await runDailyDigest();
+  return c.json({ ok: true, ...result });
 });
 
 app.post("/telegram", async (c) => {
@@ -88,5 +99,6 @@ app.post("/telegram", async (c) => {
     import("grammy"),
     import("./telegram.js"),
   ]);
-  return webhookCallback(bot, "hono")(c);
+  // timeout alto: fluxos com 2 chamadas de LLM (rotear → responder) passam de 10s.
+  return webhookCallback(bot, "hono", { timeoutMilliseconds: 25_000 })(c);
 });

@@ -1,5 +1,5 @@
 import type { ReportData } from "./report.js";
-import { fmtBRL } from "./transactions.js";
+import { fmtBRL } from "./money.js";
 
 /**
  * Gera um relatório HTML autocontido (CSS e gráficos SVG inline, zero dependências
@@ -166,19 +166,25 @@ function barsSvg(data: ReportData): string {
 function kpiCards(data: ReportData): string {
   const resClass = data.resultado >= 0 ? "pos" : "neg";
   const resSign = data.resultado >= 0 ? "Sobrou" : "Faltou";
+  // Subtotais por moeda extra (quando o usuário mistura moedas).
+  const extraMoedas = data.porMoeda.filter((m) => m.currency !== data.moedaPrincipal);
+  const saldoExtra = data.saldoPorMoeda.filter((m) => m.currency !== data.moedaPrincipal);
+  const outEC = extraMoedas.map((m) => `${m.currency} ${fmtBRL(m.saidas, m.currency)}`).join(" · ");
+  const inEC = extraMoedas.map((m) => `${m.currency} ${fmtBRL(m.entradas, m.currency)}`).join(" · ");
+  const balEC = saldoExtra.map((m) => `${m.currency} ${fmtBRL(m.total, m.currency)}`).join(" · ");
   const cards = [
     {
       icon: "🟢",
       label: "Entradas",
       value: fmtBRL(data.totalEntradas),
-      sub: `${data.countEntradas} lançamento(s)`,
+      sub: `${data.countEntradas} lançamento(s)` + (inEC ? ` · + ${inEC}` : ""),
       cls: "in",
     },
     {
       icon: "🔴",
       label: "Saídas",
       value: fmtBRL(data.totalSaidas),
-      sub: `${data.countSaidas} lançamento(s)`,
+      sub: `${data.countSaidas} lançamento(s)` + (outEC ? ` · + ${outEC}` : ""),
       cls: "out",
     },
     {
@@ -192,7 +198,7 @@ function kpiCards(data: ReportData): string {
       icon: "💼",
       label: "Saldo total",
       value: fmtBRL(data.saldoTotal),
-      sub: `${data.saldos.length} conta(s)`,
+      sub: `${data.saldos.length} conta(s)` + (balEC ? ` · + ${balEC}` : ""),
       cls: "neutral",
     },
   ];

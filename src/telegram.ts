@@ -1,51 +1,67 @@
-import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
-import type { User as DbUser } from "@prisma/client";
-import { prisma } from "./db.js";
-import { parseTransaction, summarize, type ParsedTx } from "./llm.js";
+import { Bot, Context, InlineKeyboard, InputFile, GrammyError } from "grammy";
+import type { User as DbUser, Account } from "@prisma/client";
+import { routeMessage, type ParsedTx } from "./intents.js";
+import { answerQuestion } from "./qa.js";
+import { LLM_USER_ERROR } from "./llm.js";
 import {
   addAccount,
   balances,
   createTransaction,
-  fmtBRL,
+  deleteTransactionById,
+  findLastTransaction,
+  getUserAccount,
   listAccounts,
-  resolveAccount,
+  resolveAccountFrom,
 } from "./transactions.js";
-import { buildReport, collectReportData, type ReportData } from "./report.js";
+import {
+  createPending,
+  getPending,
+  claimPending,
+  discardPending,
+  updatePendingPayload,
+  type PendingItem,
+  type PendingPayload,
+} from "./pending.js";
+import { setBudget, removeBudget, budgetAlert } from "./budgets.js";
+import { collectReportData, buildReport } from "./report.js";
 import { buildHtmlReport } from "./html-report.js";
+import { summarize } from "./llm.js";
+import { donutChartSvg, dailyBarsSvg, renderChartPng } from "./charts.js";
+import { transcribeVoice, extractReceipt, fetchTelegramFileB64 } from "./media.js";
 import {
   deactivateUser,
   inviteUser,
-  listUsers,
   resolveUser,
 } from "./users.js";
+import { fmtCents, fmtBRL, decToCents, parseAmountBR } from "./money.js";
+import { CATEGORIES, categoryEmoji } from "./categories.js";
+import { dayKeyTz, fromLocalDateString, shortDateBR } from "./dates.js";
+import { b, esc, i, code, accountIcon } from "./fmt.js";
+import {
+  reportUrl,
+  isOwner,
+  renderMenu,
+  renderHelp,
+  renderHelpSection,
+  renderSaldo,
+  renderContas,
+  renderResumo,
+  renderHoje,
+  renderCategorias,
+  renderExtrato,
+  renderMetas,
+  renderPessoas,
+  type View,
+} from "./views.js";
 
-// Contexto com o usuário resolvido pelo middleware de autenticação.
 type Ctx = Context & { user: DbUser };
 
 export const bot = new Bot<Ctx>(process.env.TELEGRAM_BOT_TOKEN || "");
 
-// Payload guardado em Pending.payload
-interface PendingPayload {
-  tipo: "entrada" | "saida";
-  valor: number;
-  moeda: string;
-  categoria: string;
-  descricao: string;
-  accountId: string | null;
-  raw: string;
-}
-
-const ACCOUNT_ICON: Record<string, string> = {
-  cartao: "💳",
-  corrente: "🏦",
-  poupanca: "🐷",
-  dinheiro: "💵",
-  cripto: "₿",
-};
+const HTML = { parse_mode: "HTML" as const };
 
 // -------------------- Autenticação multiusuário --------------------
 
-/** Resolve quem está falando. Autoriza o dono automaticamente; barra desconhecidos. */
 bot.use(async (ctx, next) => {
   const telegramId = String(ctx.from?.id ?? ctx.chat?.id ?? "");
   if (!telegramId) return;
@@ -58,33 +74,34 @@ bot.use(async (ctx, next) => {
   if (!user) {
     if (ctx.chat?.type === "private") {
       await ctx.reply(
-        `🔒 Você ainda não tem acesso ao *Fin AI*.\n\n` +
-          `Mande este código para quem te convidou:\n\`${telegramId}\`\n\n` +
-          `A pessoa te libera com \`/convidar ${telegramId} SeuNome\`.`,
-        { parse_mode: "Markdown" },
+        `🔒 Você ainda não tem acesso ao ${b("Fin AI")}.\n\n` +
+          `Mande este código para quem te convidou:\n${code(telegramId)}\n\n` +
+          `A pessoa te libera com ${code(`/convidar ${telegramId} SeuNome`)}.`,
+        HTML,
       );
     }
     return;
   }
-  ctx.user = user;
+  ctx.user = user as DbUser;
   await next();
 });
 
 // -------------------- Comandos --------------------
 
-bot.command(["start", "menu"], async (ctx) => sendMenu(ctx, ctx.user));
-bot.command(["ajuda", "help"], async (ctx) => sendHelp(ctx, ctx.user));
+bot.command(["start", "menu"], (ctx) => startOrMenu(ctx));
+bot.command(["ajuda", "help"], (ctx) => replyView(ctx, renderHelp()));
 
-bot.command("saldo", (ctx) => viewSaldo(ctx, ctx.user));
-bot.command("contas", (ctx) => viewContas(ctx, ctx.user));
-bot.command("relatorio", (ctx) => viewRelatorio(ctx, ctx.user, ctx.match));
-bot.command("planilha", (ctx) => viewPlanilha(ctx, ctx.user, ctx.match));
-bot.command("resumo", (ctx) => viewResumo(ctx, ctx.user, ctx.match));
-bot.command("hoje", (ctx) => viewHoje(ctx, ctx.user));
-bot.command("categorias", (ctx) => viewCategorias(ctx, ctx.user, ctx.match));
-bot.command("extrato", (ctx) => viewExtrato(ctx, ctx.user, ctx.match));
-bot.command(["atalho", "apikey"], (ctx) => viewAtalho(ctx, ctx.user));
-bot.command(["minhachave", "chave"], (ctx) => viewChave(ctx, ctx.user));
+bot.command("saldo", async (ctx) => replyView(ctx, await renderSaldo(ctx.user)));
+bot.command("contas", async (ctx) => replyView(ctx, await renderContas(ctx.user)));
+bot.command("relatorio", (ctx) => sendRelatorio(ctx, ctx.match));
+bot.command("planilha", (ctx) => sendPlanilha(ctx, ctx.match));
+bot.command("resumo", async (ctx) => replyView(ctx, await renderResumo(ctx.user, ctx.match)));
+bot.command("hoje", async (ctx) => replyView(ctx, await renderHoje(ctx.user)));
+bot.command("categorias", async (ctx) => replyView(ctx, await renderCategorias(ctx.user, ctx.match)));
+bot.command("extrato", async (ctx) => replyView(ctx, await renderExtrato(ctx.user, ctx.match)));
+bot.command(["metas", "meta"], (ctx) => handleMeta(ctx, ctx.match));
+bot.command(["atalho", "apikey"], (ctx) => sendAtalho(ctx, ctx.user));
+bot.command(["minhachave", "chave"], (ctx) => sendChave(ctx, ctx.user));
 
 bot.command("addconta", async (ctx) => {
   const args = (ctx.match || "").split("|").map((s) => s.trim());
@@ -99,29 +116,29 @@ bot.command("addconta", async (ctx) => {
       name: args[0],
       type: args[1] || "corrente",
       currency: (args[2] || "BRL").toUpperCase(),
-      initialBalance: args[3] ? Number(args[3].replace(",", ".")) : 0,
+      initialBalanceCents: parseAmountBR(args[3]) ?? 0,
     });
     await ctx.reply(
-      `✅ Conta criada: *${mdEsc(acc.name)}* (${acc.type}, ${acc.currency})`,
-      { parse_mode: "Markdown" },
+      `✅ Conta criada: ${b(acc.name)} (${esc(acc.type)}, ${esc(acc.currency)})`,
+      HTML,
     );
   } catch (e: any) {
-    await ctx.reply(
-      `❌ Não consegui criar a conta (nome já existe?). ${e?.message ?? ""}`,
-    );
+    await ctx.reply(`❌ Não consegui criar a conta (nome já existe?). ${e?.message ?? ""}`);
   }
 });
 
 bot.command("desfazer", async (ctx) => {
-  const last = await prisma.transaction.findFirst({
-    where: { account: { userId: ctx.user.id } },
-    orderBy: { createdAt: "desc" },
-    include: { account: true },
-  });
+  const last = await findLastTransaction(ctx.user.id);
   if (!last) return ctx.reply("Nada para desfazer.");
-  await prisma.transaction.delete({ where: { id: last.id } });
+  const kb = new InlineKeyboard()
+    .text("↩️ Desfazer", `undo:${last.id}`)
+    .text("✅ Manter", "no:keep");
   await ctx.reply(
-    `↩️ Removido: ${last.type} ${fmtBRL(Number(last.amount), last.currency)} em ${last.account.name} (${last.category}).`,
+    `Quer desfazer o último lançamento?\n\n` +
+      `${last.type === "saida" ? "🔴" : "🟢"} ${b(fmtCents(decToCents(last.amount), last.currency))} · ` +
+      `${categoryEmoji(last.category)} ${esc(last.category)} · ${esc(last.account.name)}\n` +
+      `${i(last.description || "—")}`,
+    { ...HTML, reply_markup: kb },
   );
 });
 
@@ -138,25 +155,19 @@ bot.command("convidar", async (ctx) => {
     );
   }
   const u = await inviteUser(tgId, nome);
-
-  // Tenta avisar a pessoa aqui mesmo no Telegram (só funciona se ela já abriu o bot).
   let aviso: string;
   try {
     await ctx.api.sendMessage(
       tgId,
-      `🎉 Você foi liberado(a) no *Fin AI*!\n\nMande /start para começar. Suas finanças ficam *separadas e privadas* — só você vê.`,
-      { parse_mode: "Markdown" },
+      `🎉 Você foi liberado(a) no ${b("Fin AI")}!\n\nMande /start para começar. Suas finanças ficam ${b("separadas e privadas")} — só você vê.`,
+      HTML,
     );
     aviso = "📨 Já avisei a pessoa aqui no Telegram.";
   } catch {
     aviso =
       "⚠️ Não consegui avisar automaticamente (a pessoa precisa ter aberto o bot ao menos uma vez). Peça pra ela mandar /start.";
   }
-
-  await ctx.reply(
-    `✅ *${mdEsc(u.name || tgId)}* autorizado(a)!\n${aviso}`,
-    { parse_mode: "Markdown" },
-  );
+  await ctx.reply(`✅ ${b(u.name || tgId)} autorizado(a)!\n${aviso}`, HTML);
 });
 
 bot.command("remover", async (ctx) => {
@@ -171,286 +182,543 @@ bot.command("remover", async (ctx) => {
   const u = await deactivateUser(tgId);
   if (!u) return ctx.reply("Não achei ninguém com esse id.");
   await ctx.reply(
-    `🚫 *${mdEsc(u.name || tgId)}* desativado(a). Os dados dele(a) ficam guardados, só o acesso é bloqueado.`,
-    { parse_mode: "Markdown" },
+    `🚫 ${b(u.name || tgId)} desativado(a). Os dados dele(a) ficam guardados, só o acesso é bloqueado.`,
+    HTML,
   );
 });
 
-bot.command("pessoas", (ctx) => viewPessoas(ctx, ctx.user));
+bot.command("pessoas", async (ctx) => replyView(ctx, await renderPessoas(ctx.user)));
 
-// -------------------- Texto livre → confirmação --------------------
-
-const KNOWN_COMMANDS =
-  /^\/(convidar|remover|addconta|relatorio|planilha|resumo|categorias|extrato|saldo|contas|hoje|atalho|chave|apikey|menu|ajuda|help|desfazer|pessoas|start)\b/i;
+// -------------------- Texto livre / voz / foto --------------------
 
 bot.on("message:text", async (ctx) => {
   const texto = ctx.message.text;
-  if (texto.startsWith("/")) return; // comando não reconhecido
+  if (texto.startsWith("/")) {
+    return ctx.reply(
+      `🤔 Não conheço esse comando. Veja ${code("/ajuda")} ou toque em /menu.`,
+      HTML,
+    );
+  }
+  await handleFreeText(ctx, texto);
+});
 
-  // Erro comum: mandar "Convidar /convidar ..." (texto ANTES do comando).
-  // Nesse caso o Telegram não executa o comando; então damos a dica certinha.
-  const slashIdx = texto.indexOf("/");
-  if (slashIdx > 0) {
-    const rest = texto.slice(slashIdx).trim();
-    if (KNOWN_COMMANDS.test(rest)) {
-      return ctx.reply(
-        `👉 Para usar um comando, a mensagem precisa *começar* com "/", sem nada antes. Tente:\n\`${rest}\``,
-        { parse_mode: "Markdown" },
-      );
+bot.on(["message:voice", "message:audio"], async (ctx) => {
+  const media = ctx.message.voice ?? ctx.message.audio;
+  if (!media) return;
+  if ((media.duration ?? 0) > 90 || (media.file_size ?? 0) > 5_000_000) {
+    return ctx.reply("🎤 Áudio muito longo. Manda algo curtinho (até ~1 min) ou escreve o gasto.");
+  }
+  await ctx.replyWithChatAction("typing");
+  try {
+    const file = await ctx.api.getFile(media.file_id);
+    const { b64 } = await fetchTelegramFileB64(file.file_path!);
+    const texto = await transcribeVoice(b64);
+    if (!texto) return ctx.reply("🎤 Não consegui entender o áudio. Tenta de novo?");
+    await ctx.reply(`🎤 ${i(texto)}`, HTML);
+    await handleFreeText(ctx, texto);
+  } catch (e) {
+    console.error("[voice] erro:", e);
+    await ctx.reply(LLM_USER_ERROR);
+  }
+});
+
+bot.on("message:photo", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  try {
+    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    const file = await ctx.api.getFile(photo.file_id);
+    const { b64, mime } = await fetchTelegramFileB64(file.file_path!);
+    const accs = await listAccounts(ctx.user.id);
+    if (accs.length === 0) return replyNoAccounts(ctx);
+    const lancamentos = await extractReceipt(
+      b64,
+      mime || "image/jpeg",
+      accs.map((a) => a.name),
+      ctx.message.caption,
+    );
+    if (lancamentos.length === 0) {
+      return ctx.reply("🧾 Não achei um comprovante nessa imagem. Manda a foto de uma nota ou escreve o gasto.");
+    }
+    await presentConfirm(ctx, lancamentos, `foto: ${ctx.message.caption ?? "comprovante"}`, accs);
+  } catch (e) {
+    console.error("[photo] erro:", e);
+    await ctx.reply(LLM_USER_ERROR);
+  }
+});
+
+/** Núcleo: roteia uma mensagem livre para registrar / perguntar / conversar. */
+async function handleFreeText(ctx: Ctx, texto: string) {
+  const accs = await listAccounts(ctx.user.id);
+  await ctx.replyWithChatAction("typing");
+
+  let route;
+  try {
+    route = await routeMessage(texto, { contas: accs.map((a) => a.name) });
+  } catch (e) {
+    console.error("[route] erro:", e);
+    return ctx.reply(LLM_USER_ERROR);
+  }
+
+  if (route.intencao === "conversa") {
+    return ctx.reply(esc(route.resposta || "🙂"), HTML);
+  }
+
+  if (route.intencao === "pergunta" && route.pergunta) {
+    try {
+      const resposta = await answerQuestion(ctx.user.id, ctx.user.name, texto, route.pergunta);
+      const kb = new InlineKeyboard().text("📊 Ver resumo", "m:resumo");
+      return ctx.reply(esc(resposta), { ...HTML, reply_markup: kb });
+    } catch (e) {
+      console.error("[qa] erro:", e);
+      return ctx.reply(LLM_USER_ERROR);
     }
   }
 
-  const accs = await listAccounts(ctx.user.id);
-  if (accs.length === 0) {
+  // registrar
+  if (accs.length === 0) return replyNoAccounts(ctx);
+  if (route.lancamentos.length === 0) {
     return ctx.reply(
-      "Você ainda não tem contas. Crie uma com:\n`/addconta Nubank | cartao | BRL | 0`",
-      { parse_mode: "Markdown" },
+      `🤔 Entendi que é um lançamento, mas não achei o valor.\nEx.: ${code("uber 23 ontem")}`,
+      HTML,
     );
   }
+  await presentConfirm(ctx, route.lancamentos, texto, accs);
+}
 
-  let parsed: ParsedTx;
-  try {
-    parsed = await parseTransaction(texto, accs.map((a) => a.name));
-  } catch (e: any) {
-    return ctx.reply(`❌ Não entendi o lançamento. (${e?.message ?? e})`);
-  }
+function replyNoAccounts(ctx: Ctx) {
+  return ctx.reply(
+    `Você ainda não tem contas. Crie uma com:\n${code("/addconta Nubank | cartao | BRL | 0")}\n\nOu toque em /start.`,
+    HTML,
+  );
+}
 
-  // Não registra lançamento sem valor — evita "Saída R$ 0,00" de frases que não são gastos.
-  if (!parsed.valor || parsed.valor <= 0) {
-    return ctx.reply(
-      "🤔 Não identifiquei um valor válido nesse lançamento.\nEx: `gastei 45 no posto no nubank`",
-      { parse_mode: "Markdown" },
-    );
-  }
+// -------------------- Card de confirmação --------------------
 
-  const acc = await resolveAccount(ctx.user.id, parsed.conta);
-
-  const payload: PendingPayload = {
-    tipo: parsed.tipo,
-    valor: parsed.valor,
-    moeda: acc?.currency || parsed.moeda,
-    categoria: parsed.categoria,
-    descricao: parsed.descricao,
-    accountId: acc?.id ?? null,
-    raw: texto,
-  };
-  const pending = await prisma.pending.create({
-    data: { chatId: String(ctx.chat.id), payload: payload as any },
+async function presentConfirm(
+  ctx: Ctx,
+  lancamentos: ParsedTx[],
+  raw: string,
+  accs: Account[],
+) {
+  const items: PendingItem[] = lancamentos.map((l) => {
+    const acc = resolveAccountFrom(accs, l.conta);
+    return {
+      tipo: l.tipo,
+      valorCents: l.valorCents,
+      moeda: acc?.currency || l.moeda,
+      categoria: l.categoria,
+      descricao: l.descricao,
+      accountId: acc?.id ?? null,
+      occurredAt: l.data ?? undefined,
+    };
   });
+  const confianca = Math.min(...lancamentos.map((l) => l.confianca));
+  const payload: PendingPayload = { v: 2, items, raw, confianca };
+  const { id } = await createPending(String(ctx.chat!.id), payload);
+  const view = confirmCard(id, payload, accs);
+  await ctx.reply(view.text, { ...HTML, reply_markup: view.kb });
+}
 
-  if (!acc) {
-    const kb = new InlineKeyboard();
-    accs.forEach((a, i) => {
-      kb.text(a.name, `acc:${pending.id}:${a.id}`);
-      if (i % 2 === 1) kb.row();
+function occurredLabel(dateStr: string): string {
+  const now = Date.now();
+  const ontem = dayKeyTz(new Date(now - 86_400_000));
+  const anteontem = dayKeyTz(new Date(now - 2 * 86_400_000));
+  const rel = dateStr === ontem ? "ontem " : dateStr === anteontem ? "anteontem " : "";
+  return `${rel}(${shortDateBR(dateStr)})`;
+}
+
+function itemLine(it: PendingItem, accName: string | null): string {
+  const emoji = it.tipo === "saida" ? "🔴" : "🟢";
+  const conta = accName ? ` · ${esc(accName)}` : "";
+  return `${emoji} ${b(fmtCents(it.valorCents, it.moeda))} · ${categoryEmoji(it.categoria)} ${esc(it.categoria)}${conta}`;
+}
+
+function confirmCard(
+  pendingId: string,
+  payload: PendingPayload,
+  accs: Account[],
+): View {
+  const nameById = new Map(accs.map((a) => [a.id, a.name]));
+  const items = payload.items;
+  const needsAccount = items.some((it) => !it.accountId);
+  const lowConf = (payload.confianca ?? 1) < 0.6;
+
+  let text: string;
+  if (items.length === 1) {
+    const it = items[0];
+    const accName = it.accountId ? nameById.get(it.accountId) ?? null : null;
+    const lines = [
+      `${it.tipo === "saida" ? "🔴 Saída" : "🟢 Entrada"} de ${b(fmtCents(it.valorCents, it.moeda))}`,
+      `${categoryEmoji(it.categoria)} ${esc(it.categoria)}${accName ? ` · ${esc(accName)}` : ""}`,
+    ];
+    if (it.descricao) lines.push(`📝 ${i(it.descricao)}`);
+    if (it.occurredAt) lines.push(`📅 ${esc(occurredLabel(it.occurredAt))}`);
+    text = lines.join("\n");
+  } else {
+    const totalByCur = new Map<string, number>();
+    const lines = items.map((it, idx) => {
+      const accName = it.accountId ? nameById.get(it.accountId) ?? null : null;
+      if (it.tipo === "saida")
+        totalByCur.set(it.moeda, (totalByCur.get(it.moeda) ?? 0) + it.valorCents);
+      const date = it.occurredAt ? ` 📅 ${esc(occurredLabel(it.occurredAt))}` : "";
+      return `${idx + 1}. ${itemLine(it, accName)}${date}`;
     });
-    kb.row().text("❌ Cancelar", `no:${pending.id}`);
-    return ctx.reply(
-      `${emoji(parsed.tipo)} ${fmtBRL(parsed.valor, payload.moeda)} — ${parsed.categoria}\n` +
-        `_${mdEsc(parsed.descricao)}_\n\nEm qual conta?`,
-      { parse_mode: "Markdown", reply_markup: kb },
-    );
+    const totais = [...totalByCur.entries()]
+      .map(([cur, c]) => fmtCents(c, cur))
+      .join(" · ");
+    text = `${b(`${items.length} lançamentos`)}\n${lines.join("\n")}` + (totais ? `\n\n🔴 Total: ${esc(totais)}` : "");
   }
 
-  await ctx.reply(confirmText(payload, acc.name), {
-    parse_mode: "Markdown",
-    reply_markup: confirmKb(pending.id),
-  });
+  const header = lowConf
+    ? `🤔 ${b("Não tenho certeza — confere pra mim?")}\n\n`
+    : "";
+  text = header + text + `\n\n${needsAccount ? "Em qual conta?" : "Confirmar?"}`;
+
+  const kb = new InlineKeyboard();
+  if (needsAccount) {
+    accs.forEach((a, idx) => {
+      kb.text(`${accountIcon(a.type)} ${a.name}`, `acc:${pendingId}:${a.id}`);
+      if (idx % 2 === 1) kb.row();
+    });
+    kb.row().text("❌ Cancelar", `no:${pendingId}`);
+  } else {
+    kb.text("✅ Confirmar", `ok:${pendingId}`).text("❌ Cancelar", `no:${pendingId}`);
+    if (items.length === 1) kb.row().text("✏️ Categoria", `cat:${pendingId}`);
+  }
+  return { text, kb };
+}
+
+// -------------------- Callbacks: confirmação --------------------
+
+bot.callbackQuery(/^acc:([^:]+):(.+)$/, async (ctx) => {
+  const [, pendingId, accountId] = ctx.match;
+  const chatId = String(ctx.chat?.id);
+  const pending = await getPending(pendingId, chatId);
+  if (!pending) return expired(ctx);
+  const acc = await getUserAccount(accountId, ctx.user.id);
+  if (!acc) return ctx.answerCallbackQuery("Conta inválida.");
+
+  for (const it of pending.payload.items) {
+    if (!it.accountId) {
+      it.accountId = acc.id;
+      it.moeda = acc.currency;
+    }
+  }
+  await updatePendingPayload(pendingId, pending.payload);
+  const accs = await listAccounts(ctx.user.id);
+  const view = confirmCard(pendingId, pending.payload, accs);
+  await editText(ctx, view);
+  await ctx.answerCallbackQuery();
 });
 
-// -------------------- Callbacks: confirmação de lançamento --------------------
+bot.callbackQuery(/^cat:(.+)$/, async (ctx) => {
+  const pendingId = ctx.match[1];
+  const pending = await getPending(pendingId, String(ctx.chat?.id));
+  if (!pending) return expired(ctx);
+  await ctx.answerCallbackQuery();
+  const kb = new InlineKeyboard();
+  CATEGORIES.forEach((c, idx) => {
+    kb.text(`${c.emoji} ${c.name}`, `catq:${pendingId}:${idx}`);
+    if (idx % 2 === 1) kb.row();
+  });
+  kb.row().text("⬅️ Voltar", `bk:${pendingId}`);
+  await editText(ctx, { text: `✏️ ${b("Escolha a categoria:")}`, kb });
+});
 
-bot.callbackQuery(/^acc:(.+):(.+)$/, async (ctx) => {
-  const [, pendingId, accountId] = ctx.match;
-  const pending = await prisma.pending.findUnique({ where: { id: pendingId } });
-  if (!pending || pending.chatId !== String(ctx.chat?.id)) {
-    return ctx.answerCallbackQuery("Expirado.");
+bot.callbackQuery(/^catq:([^:]+):(\d+)$/, async (ctx) => {
+  const [, pendingId, idxStr] = ctx.match;
+  const pending = await getPending(pendingId, String(ctx.chat?.id));
+  if (!pending) return expired(ctx);
+  const cat = CATEGORIES[Number(idxStr)];
+  if (cat && pending.payload.items[0]) {
+    pending.payload.items[0].categoria = cat.name;
+    await updatePendingPayload(pendingId, pending.payload);
   }
-  const acc = await prisma.account.findUnique({ where: { id: accountId } });
-  if (!acc || acc.userId !== ctx.user.id) {
-    return ctx.answerCallbackQuery("Conta inválida.");
-  }
-  const payload = pending.payload as unknown as PendingPayload;
-  payload.accountId = acc.id;
-  payload.moeda = acc.currency;
-  await prisma.pending.update({
-    where: { id: pendingId },
-    data: { payload: payload as any },
-  });
-  await ctx.editMessageText(confirmText(payload, acc.name), {
-    parse_mode: "Markdown",
-    reply_markup: confirmKb(pendingId),
-  });
+  const accs = await listAccounts(ctx.user.id);
+  await editText(ctx, confirmCard(pendingId, pending.payload, accs));
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery(/^bk:(.+)$/, async (ctx) => {
+  const pendingId = ctx.match[1];
+  const pending = await getPending(pendingId, String(ctx.chat?.id));
+  if (!pending) return expired(ctx);
+  const accs = await listAccounts(ctx.user.id);
+  await editText(ctx, confirmCard(pendingId, pending.payload, accs));
   await ctx.answerCallbackQuery();
 });
 
 bot.callbackQuery(/^ok:(.+)$/, async (ctx) => {
   const pendingId = ctx.match[1];
-  const pending = await prisma.pending.findUnique({ where: { id: pendingId } });
-  if (!pending || pending.chatId !== String(ctx.chat?.id)) {
-    return ctx.answerCallbackQuery("Expirado.");
-  }
-  const p = pending.payload as unknown as PendingPayload;
-  if (!p.accountId) return ctx.answerCallbackQuery("Escolha a conta primeiro.");
+  const chatId = String(ctx.chat?.id);
+  const pending = await getPending(pendingId, chatId);
+  if (!pending) return expired(ctx);
 
-  const acc = await prisma.account.findUnique({ where: { id: p.accountId } });
-  if (!acc || acc.userId !== ctx.user.id) {
-    return ctx.answerCallbackQuery("Conta inválida.");
+  const items = pending.payload.items;
+  if (items.some((it) => !it.accountId)) {
+    return ctx.answerCallbackQuery("Escolha a conta primeiro.");
+  }
+  // Valida posse de todas as contas ANTES do claim.
+  for (const it of items) {
+    const acc = await getUserAccount(it.accountId!, ctx.user.id);
+    if (!acc) return ctx.answerCallbackQuery("Conta inválida.");
+  }
+  // Claim atômico: o segundo clique perde a corrida aqui.
+  if (!(await claimPending(pendingId, chatId))) {
+    return ctx.answerCallbackQuery("Já processado ✅");
   }
 
-  await createTransaction({
-    accountId: p.accountId,
-    type: p.tipo,
-    amount: p.valor,
-    currency: p.moeda,
-    category: p.categoria,
-    description: p.descricao,
-    source: "telegram",
-    rawInput: p.raw,
-  });
-  await prisma.pending.delete({ where: { id: pendingId } });
+  let created;
+  try {
+    created = [];
+    for (const it of items) {
+      const tx = await createTransaction({
+        accountId: it.accountId!,
+        type: it.tipo,
+        amountCents: it.valorCents,
+        currency: it.moeda,
+        category: it.categoria,
+        description: it.descricao,
+        source: "telegram",
+        rawInput: pending.payload.raw,
+        occurredAt: it.occurredAt ? fromLocalDateString(it.occurredAt) ?? undefined : undefined,
+      });
+      created.push(tx);
+    }
+  } catch (e) {
+    console.error("[ok] falha ao salvar:", e);
+    await ctx.answerCallbackQuery("Erro ao salvar");
+    return editText(ctx, {
+      text: "😵 Não consegui salvar agora. Manda o lançamento de novo, por favor.",
+    });
+  }
 
   const rows = await balances(ctx.user.id);
-  const saldo = rows.find((r) => r.name === acc.name);
-  await ctx.editMessageText(
-    `✅ Salvo!\n${emoji(p.tipo)} ${fmtBRL(p.valor, p.moeda)} — ${p.categoria} em *${mdEsc(acc.name)}*` +
-      (saldo ? `\nSaldo da conta: ${fmtBRL(saldo.balance, saldo.currency)}` : ""),
-    { parse_mode: "Markdown" },
+  const balById = new Map(rows.map((r) => [r.accountId, r]));
+
+  // Alertas de meta (categorias de saída, sem repetir).
+  const catsSaida = [...new Set(items.filter((it) => it.tipo === "saida").map((it) => it.categoria))];
+  const alerts = (await Promise.all(catsSaida.map((c) => budgetAlert(ctx.user.id, c)))).filter(
+    (a): a is string => !!a,
   );
+
+  let text: string;
+  const kb = new InlineKeyboard();
+  if (items.length === 1) {
+    const it = items[0];
+    const bal = balById.get(it.accountId!);
+    text =
+      `✅ ${b("Salvo!")}\n${itemLine(it, bal?.name ?? null)}` +
+      (bal ? `\n💼 Saldo da conta: ${esc(fmtCents(bal.balanceCents, bal.currency))}` : "");
+    kb.text("↩️ Desfazer", `undo:${created[0].id}`).text("📅 Hoje", "m:hoje");
+  } else {
+    const lines = items.map((it) => itemLine(it, balById.get(it.accountId!)?.name ?? null));
+    text = `✅ ${b(`${items.length} lançamentos salvos!`)}\n${lines.join("\n")}`;
+    kb.text("📅 Hoje", "m:hoje").text("⚡ Resumo", "m:resumo");
+  }
+  if (alerts.length) text += `\n\n${alerts.map(esc).join("\n")}`;
+
+  await editText(ctx, { text, kb });
   await ctx.answerCallbackQuery("Salvo ✅");
+});
+
+bot.callbackQuery("no:keep", async (ctx) => {
+  await ctx.answerCallbackQuery("Mantido 👍");
+  await editText(ctx, { text: "👍 Ok, mantido." });
 });
 
 bot.callbackQuery(/^no:(.+)$/, async (ctx) => {
   const pendingId = ctx.match[1];
-  await prisma.pending.deleteMany({
-    where: { id: pendingId, chatId: String(ctx.chat?.id) },
-  });
-  await ctx.editMessageText("❌ Cancelado.");
+  await discardPending(pendingId, String(ctx.chat?.id));
+  await editText(ctx, { text: "❌ Cancelado." });
   await ctx.answerCallbackQuery();
 });
 
-// -------------------- Callbacks: menu interativo --------------------
-
-bot.callbackQuery("m:home", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await ctx.editMessageText(menuText(ctx.user), {
-    parse_mode: "Markdown",
-    reply_markup: mainMenuKb(ctx.user),
+bot.callbackQuery(/^undo:(.+)$/, async (ctx) => {
+  const txId = ctx.match[1];
+  const deleted = await deleteTransactionById(txId, ctx.user.id);
+  if (!deleted) {
+    await ctx.answerCallbackQuery("Esse lançamento já não existe.");
+    return;
+  }
+  await editText(ctx, {
+    text:
+      `↩️ ${b("Desfeito")}: ${deleted.type === "saida" ? "🔴" : "🟢"} ` +
+      `${esc(fmtCents(deleted.amountCents, deleted.currency))} · ${categoryEmoji(deleted.category)} ${esc(deleted.category)} em ${esc(deleted.accountName)}.`,
   });
+  await ctx.answerCallbackQuery("Desfeito ↩️");
 });
-bot.callbackQuery("m:help", async (ctx) => {
+
+// -------------------- Callbacks: menu (edit-in-place) --------------------
+
+bot.callbackQuery("m:home", (ctx) => editView(ctx, renderMenu(ctx.user)));
+bot.callbackQuery("m:help", (ctx) => editView(ctx, renderHelp()));
+bot.callbackQuery("m:saldo", async (ctx) => editView(ctx, await renderSaldo(ctx.user)));
+bot.callbackQuery("m:contas", async (ctx) => editView(ctx, await renderContas(ctx.user)));
+bot.callbackQuery("m:resumo", async (ctx) => editView(ctx, await renderResumo(ctx.user, "mes")));
+bot.callbackQuery("m:categorias", async (ctx) => editView(ctx, await renderCategorias(ctx.user, "mes")));
+bot.callbackQuery("m:hoje", async (ctx) => editView(ctx, await renderHoje(ctx.user)));
+bot.callbackQuery("m:extrato", async (ctx) => editView(ctx, await renderExtrato(ctx.user, "10")));
+bot.callbackQuery("m:metas", async (ctx) => editView(ctx, await renderMetas(ctx.user)));
+bot.callbackQuery("m:pessoas", async (ctx) => editView(ctx, await renderPessoas(ctx.user)));
+bot.callbackQuery(/^h:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
-  await sendHelp(ctx, ctx.user);
+  await editText(ctx, renderHelpSection(ctx.match[1]));
 });
-bot.callbackQuery("m:saldo", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await viewSaldo(ctx, ctx.user);
-});
-bot.callbackQuery("m:contas", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await viewContas(ctx, ctx.user);
-});
-bot.callbackQuery("m:resumo", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await viewResumo(ctx, ctx.user, "mes");
-});
+
 bot.callbackQuery("m:relatorio", async (ctx) => {
   await ctx.answerCallbackQuery("Gerando relatório…");
-  await viewRelatorio(ctx, ctx.user, "mes");
-});
-bot.callbackQuery("m:categorias", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await viewCategorias(ctx, ctx.user, "mes");
-});
-bot.callbackQuery("m:hoje", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await viewHoje(ctx, ctx.user);
-});
-bot.callbackQuery("m:extrato", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await viewExtrato(ctx, ctx.user, "10");
+  await sendRelatorio(ctx, "mes");
 });
 bot.callbackQuery("m:atalho", async (ctx) => {
   await ctx.answerCallbackQuery();
-  await viewAtalho(ctx, ctx.user);
+  await sendAtalho(ctx, ctx.user);
 });
 bot.callbackQuery("m:chave", async (ctx) => {
   await ctx.answerCallbackQuery();
-  await viewChave(ctx, ctx.user);
+  await sendChave(ctx, ctx.user);
 });
 bot.callbackQuery("m:novaconta", async (ctx) => {
   await ctx.answerCallbackQuery();
   await ctx.reply(
-    "➕ *Nova conta*\nMande:\n`/addconta Nome | tipo | moeda | saldoInicial`\n\n" +
-      "Tipos: corrente, poupanca, cartao, dinheiro, cripto\nEx: `/addconta Itaú | corrente | BRL | 1500`",
-    { parse_mode: "Markdown" },
+    `➕ ${b("Nova conta")}\nMande:\n${code("/addconta Nome | tipo | moeda | saldoInicial")}\n\n` +
+      `Tipos: corrente, poupanca, cartao, dinheiro, cripto\nEx: ${code("/addconta Itaú | corrente | BRL | 1500")}`,
+    HTML,
   );
 });
-bot.callbackQuery("m:pessoas", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await viewPessoas(ctx, ctx.user);
+
+// -------------------- Callbacks: gráficos --------------------
+
+bot.callbackQuery(/^g:(cat|dia):(.+)$/, async (ctx) => {
+  const [, kind, per] = ctx.match;
+  await ctx.answerCallbackQuery("Gerando gráfico…");
+  await ctx.replyWithChatAction("upload_photo");
+  try {
+    const data = await collectReportData(ctx.user.id, ctx.user.name, per);
+    const svg = kind === "cat" ? donutChartSvg(data) : dailyBarsSvg(data);
+    const png = await renderChartPng(svg);
+    if (png) {
+      const caption =
+        kind === "cat"
+          ? `🍩 Gastos por categoria — ${data.periodo}`
+          : `📊 Fluxo diário — ${data.periodo}`;
+      await ctx.replyWithPhoto(new InputFile(png, "grafico.png"), { caption });
+    } else {
+      // Fallback textual quando a rasterização falha.
+      const view = kind === "cat" ? await renderCategorias(ctx.user, per) : await renderResumo(ctx.user, per);
+      await replyView(ctx, view);
+    }
+  } catch (e) {
+    console.error("[chart] erro:", e);
+    await ctx.reply("😵 Não consegui gerar o gráfico agora.");
+  }
 });
 
-// -------------------- Views (reutilizadas por comandos e botões) --------------------
+// -------------------- Onboarding --------------------
 
-async function viewSaldo(ctx: Ctx, user: DbUser) {
-  const [rows, accs] = await Promise.all([
-    balances(user.id),
-    listAccounts(user.id),
-  ]);
-  if (rows.length === 0) {
-    return ctx.reply("Você ainda não tem contas. Use /addconta.");
-  }
-  const typeByName = new Map(accs.map((a) => [a.name, a.type]));
-  const total = rows.reduce((s, r) => s + r.balance, 0);
-  const lines = rows.map((r) => {
-    const icon = ACCOUNT_ICON[typeByName.get(r.name) || "corrente"] || "🏦";
-    return `${icon} *${mdEsc(r.name)}*: ${fmtBRL(r.balance, r.currency)}`;
+const SUGGESTED_ACCOUNTS = ["Nubank", "Itaú", "Bradesco", "Caixa", "Carteira", "PicPay"];
+
+async function startOrMenu(ctx: Ctx) {
+  const accs = await listAccounts(ctx.user.id);
+  if (accs.length > 0) return replyView(ctx, renderMenu(ctx.user));
+
+  const kb = new InlineKeyboard();
+  SUGGESTED_ACCOUNTS.forEach((name, idx) => {
+    kb.text(name, `ob:acc:${idx}`);
+    if (idx % 2 === 1) kb.row();
   });
+  kb.row().text("✍️ Outra conta", "ob:skip");
   await ctx.reply(
-    `📊 *Saldos*\n${lines.join("\n")}\n\n💼 *Total:* ${fmtBRL(total)}`,
-    { parse_mode: "Markdown" },
+    `👋 ${b("Bem-vindo(a) ao Fin AI!")}\n\n` +
+      `Eu anoto seus gastos quando você escreve (ou fala) em linguagem natural.\n\n` +
+      `Pra começar, ${b("crie sua primeira conta")} 👇`,
+    { ...HTML, reply_markup: kb },
   );
 }
 
-async function viewContas(ctx: Ctx, user: DbUser) {
-  const accs = await listAccounts(user.id);
-  if (accs.length === 0) {
-    return ctx.reply("Você ainda não tem contas. Use /addconta.");
+bot.callbackQuery(/^ob:acc:(\d+)$/, async (ctx) => {
+  const name = SUGGESTED_ACCOUNTS[Number(ctx.match[1])];
+  if (!name) return ctx.answerCallbackQuery("Opção inválida.");
+  try {
+    await addAccount({
+      userId: ctx.user.id,
+      name,
+      type: name === "Carteira" ? "dinheiro" : "corrente",
+    });
+    await ctx.answerCallbackQuery(`Conta ${name} criada!`);
+    await editText(ctx, {
+      text:
+        `✅ Conta ${b(name)} criada!\n\n` +
+        `Agora me conta um gasto — por exemplo:\n${code("gastei 25 no almoço")}`,
+    });
+  } catch {
+    await ctx.answerCallbackQuery("Você já tem essa conta.");
   }
-  const lines = accs.map((a) => {
-    const icon = ACCOUNT_ICON[a.type] || "🏦";
-    return `${icon} *${mdEsc(a.name)}* — ${a.type}, ${a.currency} · inicial ${fmtBRL(Number(a.initialBalance), a.currency)}`;
+});
+
+bot.callbackQuery("ob:skip", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await editText(ctx, {
+    text:
+      `➕ ${b("Criar conta")}\nMande:\n${code("/addconta Nome | tipo | moeda | saldoInicial")}\n\n` +
+      `Ex: ${code("/addconta Inter | corrente | BRL | 0")}`,
   });
-  await ctx.reply(`🏦 *Contas*\n${lines.join("\n")}`, { parse_mode: "Markdown" });
+});
+
+// -------------------- Metas --------------------
+
+async function handleMeta(ctx: Ctx, arg?: string) {
+  const raw = (arg || "").trim();
+  if (!raw) return replyView(ctx, await renderMetas(ctx.user));
+
+  const parts = raw.split(/\s+/);
+  const valorStr = parts[parts.length - 1];
+  const categoria = parts.slice(0, -1).join(" ");
+  if (!categoria) {
+    return ctx.reply(
+      `Formato: ${code("/meta Categoria valor")}\nEx.: ${code("/meta Alimentação 800")} · remover com valor ${code("0")}.`,
+      HTML,
+    );
+  }
+  const cents = parseAmountBR(valorStr);
+  if (valorStr === "0" || cents === 0) {
+    const removed = await removeBudget(ctx.user.id, categoria);
+    return ctx.reply(removed ? `🗑️ Meta de ${b(categoria)} removida.` : "Não havia meta nessa categoria.", HTML);
+  }
+  if (!cents) {
+    return ctx.reply(`Valor inválido. Ex.: ${code("/meta Alimentação 800")}`, HTML);
+  }
+  const meta = await setBudget(ctx.user.id, categoria, cents);
+  await ctx.reply(
+    `🎯 Meta de ${categoryEmoji(meta.category)} ${b(meta.category)} definida: ${esc(fmtCents(meta.amountCents))}/mês.`,
+    HTML,
+  );
 }
 
-async function viewRelatorio(ctx: Ctx, user: DbUser, arg?: string) {
+// -------------------- Documentos e chave --------------------
+
+async function sendRelatorio(ctx: Ctx, arg?: string) {
   await ctx.replyWithChatAction("upload_document");
   try {
-    const data = await collectReportData(user.id, user.name, arg);
-    const resumo = data.countTx > 0 ? await summarize(data) : "";
+    const data = await collectReportData(ctx.user.id, ctx.user.name, arg);
+    const resumo = data.countTx > 0 ? await summarize(ctx.user.id, data) : "";
     const html = buildHtmlReport(data, resumo);
-    const filename = `fin-ai-${data.from.toISOString().slice(0, 10)}_a_${data.to
-      .toISOString()
-      .slice(0, 10)}.html`;
-    const url = reportUrl(user, arg);
-    const kb = url
-      ? new InlineKeyboard().url("🌐 Abrir relatório online", url)
-      : undefined;
-    await ctx.replyWithDocument(
-      new InputFile(Buffer.from(html, "utf8"), filename),
-      { caption: reportCaption(data, resumo), reply_markup: kb },
-    );
+    const filename = `fin-ai-${dayKeyTz(data.from)}_a_${dayKeyTz(data.to)}.html`;
+    const url = reportUrl(ctx.user, arg);
+    const kb = url ? new InlineKeyboard().url("🌐 Abrir relatório online", url) : undefined;
+    await ctx.replyWithDocument(new InputFile(Buffer.from(html, "utf8"), filename), {
+      caption: reportCaption(data, resumo),
+      reply_markup: kb,
+    });
   } catch (e: any) {
     await ctx.reply(`❌ Erro ao gerar relatório: ${e?.message ?? e}`);
   }
 }
 
-async function viewPlanilha(ctx: Ctx, user: DbUser, arg?: string) {
+async function sendPlanilha(ctx: Ctx, arg?: string) {
   await ctx.replyWithChatAction("upload_document");
   try {
-    const { buffer, filename, stats } = await buildReport(user.id, user.name, arg);
+    const { buffer, filename, stats } = await buildReport(ctx.user.id, ctx.user.name, arg);
     await ctx.replyWithDocument(new InputFile(buffer, filename), {
       caption: reportCaption(stats),
     });
@@ -459,107 +727,20 @@ async function viewPlanilha(ctx: Ctx, user: DbUser, arg?: string) {
   }
 }
 
-async function viewResumo(ctx: Ctx, user: DbUser, arg?: string) {
-  await ctx.replyWithChatAction("typing");
-  const data = await collectReportData(user.id, user.name, arg);
-  if (data.countTx === 0) {
-    return ctx.reply(`📭 Sem lançamentos em *${mdEsc(data.periodo)}*.`, {
-      parse_mode: "Markdown",
-    });
-  }
-  const resumo = await summarize(data);
-  const top = data.porCategoria
-    .slice(0, 3)
-    .map((c) => `   • ${mdEsc(c.categoria)}: ${fmtBRL(c.total)} (${c.pct.toFixed(0)}%)`)
-    .join("\n");
-  const url = reportUrl(user, arg);
-  const kb = url
-    ? new InlineKeyboard().url("🌐 Ver relatório completo", url)
-    : undefined;
+async function sendChave(ctx: Ctx, user: DbUser) {
   await ctx.reply(
-    `${resumoHeader(data)}` +
-      (top ? `\n\n🍩 *Maiores categorias*\n${top}` : "") +
-      (resumo ? `\n\n🧠 _${mdEsc(resumo)}_` : ""),
-    { parse_mode: "Markdown", reply_markup: kb },
-  );
-}
-
-async function viewHoje(ctx: Ctx, user: DbUser) {
-  const data = await collectReportData(user.id, user.name, "hoje");
-  if (data.countTx === 0) {
-    return ctx.reply("📭 Nada lançado hoje ainda. Bora registrar? 😉");
-  }
-  const linhas = [...data.txs]
-    .reverse()
-    .slice(0, 15)
-    .map((t) => {
-      const sign = t.tipo === "saida" ? "🔴 -" : "🟢 +";
-      return `${sign}${fmtBRL(t.valor)} · ${mdEsc(t.categoria)} — _${mdEsc(t.descricao || "—")}_`;
-    })
-    .join("\n");
-  await ctx.reply(`📅 *Hoje*\n${linhas}\n\n${resumoHeader(data)}`, {
-    parse_mode: "Markdown",
-  });
-}
-
-async function viewCategorias(ctx: Ctx, user: DbUser, arg?: string) {
-  const data = await collectReportData(user.id, user.name, arg);
-  if (data.porCategoria.length === 0) {
-    return ctx.reply(`📭 Sem gastos em *${mdEsc(data.periodo)}*.`, {
-      parse_mode: "Markdown",
-    });
-  }
-  const linhas = data.porCategoria
-    .slice(0, 10)
-    .map(
-      (c) =>
-        `${textBar(c.pct)} *${mdEsc(c.categoria)}*\n   ${fmtBRL(c.total)} · ${c.pct.toFixed(1)}%`,
-    )
-    .join("\n");
-  await ctx.reply(
-    `🍩 *Gastos por categoria — ${mdEsc(data.periodo)}*\n\n${linhas}\n\n🔴 Total: ${fmtBRL(data.totalSaidas)}`,
-    { parse_mode: "Markdown" },
-  );
-}
-
-async function viewExtrato(ctx: Ctx, user: DbUser, arg?: string) {
-  const n = Math.min(30, Math.max(1, Math.floor(Number((arg || "").trim())) || 10));
-  const txs = await prisma.transaction.findMany({
-    where: { account: { userId: user.id } },
-    orderBy: { occurredAt: "desc" },
-    take: n,
-    include: { account: true },
-  });
-  if (txs.length === 0) return ctx.reply("Sem lançamentos ainda.");
-  const linhas = txs.map((t) => {
-    const val = Number(t.amount);
-    const sign = t.type === "saida" ? "🔴 -" : "🟢 +";
-    const d = t.occurredAt.toLocaleDateString("pt-BR", {
-      day: "2-digit",
-      month: "2-digit",
-    });
-    return `${sign}${fmtBRL(val, t.currency)} · ${mdEsc(t.category)} · ${mdEsc(t.account.name)}\n   _${mdEsc(t.description || "—")}_ · ${d}`;
-  });
-  await ctx.reply(
-    `🧾 *Últimos ${txs.length} lançamentos*\n\n${linhas.join("\n")}`,
-    { parse_mode: "Markdown" },
-  );
-}
-
-async function viewChave(ctx: Ctx, user: DbUser) {
-  await ctx.reply(
-    `🔑 *Sua chave pessoal do Fin AI*\n\n` +
-      `\`${user.shortcutKey}\`\n\n` +
+    `🔑 ${b("Sua chave pessoal do Fin AI")}\n\n` +
+      `${code(user.shortcutKey)}\n\n` +
       `👆 Toque na chave para copiar.\n` +
-      `Cole no campo *x-api-key* do seu atalho do iOS. 🔒 Não compartilhe — é só sua.`,
-    { parse_mode: "Markdown" },
+      `Cole no campo ${b("x-api-key")} do seu atalho do iOS. 🔒 Não compartilhe — é só sua.`,
+    HTML,
   );
 }
 
-async function viewAtalho(ctx: Ctx, user: DbUser) {
+async function sendAtalho(ctx: Ctx, user: DbUser) {
   const base = process.env.APP_URL?.replace(/\/$/, "") || "https://seu-app.vercel.app";
   const link = reportUrl(user, "mes");
-  const template = process.env.SHORTCUT_TEMPLATE_URL; // link iCloud do atalho pronto (opcional)
+  const template = process.env.SHORTCUT_TEMPLATE_URL;
 
   const kb = new InlineKeyboard();
   if (template) kb.url("📲 Instalar o atalho no iPhone", template).row();
@@ -567,172 +748,32 @@ async function viewAtalho(ctx: Ctx, user: DbUser) {
   kb.text("🔑 Copiar minha chave", "m:chave");
 
   const linhas = [
-    "📲 *Integração / Atalho do iOS*",
+    `📲 ${b("Integração / Atalho do iOS")}`,
     "",
-    "*Sua chave pessoal* (não compartilhe):",
-    "`" + user.shortcutKey + "`",
+    `${b("Sua chave pessoal")} (não compartilhe):`,
+    code(user.shortcutKey),
     "",
   ];
   if (template) {
     linhas.push(
-      "*Como colocar no iPhone:*",
-      "1️⃣ Toque em *Instalar o atalho* aqui embaixo.",
-      "2️⃣ Dentro do atalho, na ação _Obter conteúdo de URL_ → cabeçalho `x-api-key`, cole a *sua chave* acima.",
+      `${b("Como colocar no iPhone:")}`,
+      "1️⃣ Toque em Instalar o atalho aqui embaixo.",
+      `2️⃣ Dentro do atalho, na ação ${i("Obter conteúdo de URL")} → cabeçalho ${code("x-api-key")}, cole a sua chave acima.`,
       "3️⃣ Pronto! Rode o atalho e fale/escreva o gasto.",
     );
   } else {
     linhas.push(
-      "*Monte um atalho* com a ação _Obter conteúdo de URL_:",
-      "• URL: `" + base + "/api/shortcut`",
+      `${b("Monte um atalho")} com a ação ${i("Obter conteúdo de URL")}:`,
+      `• URL: ${code(base + "/api/shortcut")}`,
       "• Método: POST",
-      "• Cabeçalho `x-api-key`: _sua chave acima_",
-      '• Corpo (JSON): `{ "texto": "gastei 45 no posto" }`',
-      "",
-      "_(A URL acima é só o endereço de envio — não abre nada se você tocar nela.)_",
+      `• Cabeçalho ${code("x-api-key")}: sua chave acima`,
+      `• Corpo (JSON): ${code('{ "texto": "gastei 45 no posto" }')}`,
     );
   }
-  await ctx.reply(linhas.join("\n"), {
-    parse_mode: "Markdown",
-    reply_markup: kb,
-  });
+  await ctx.reply(linhas.join("\n"), { ...HTML, reply_markup: kb });
 }
 
-async function viewPessoas(ctx: Ctx, user: DbUser) {
-  if (!isOwner(user)) return ctx.reply("🔒 Só o dono vê as pessoas.");
-  const users = await listUsers();
-  const withCounts = await Promise.all(
-    users.map(async (u) => ({
-      u,
-      contas: await prisma.account.count({ where: { userId: u.id } }),
-    })),
-  );
-  const lines = withCounts.map(({ u, contas }) => {
-    const badge = u.role === "owner" ? "👑" : u.active ? "👤" : "🚫";
-    const status = u.active ? "" : " _(inativo)_";
-    return `${badge} *${mdEsc(u.name || "sem nome")}*${status}\n   id \`${u.telegramId}\` · ${contas} conta(s)`;
-  });
-  await ctx.reply(
-    `👥 *Pessoas no Fin AI* (${users.length})\n\n${lines.join("\n")}\n\n` +
-      `Convidar: \`/convidar <id> <nome>\`\nRemover: \`/remover <id>\``,
-    { parse_mode: "Markdown" },
-  );
-}
-
-// -------------------- Menu & ajuda --------------------
-
-function menuText(user: DbUser): string {
-  const nome = user.name ? `, ${mdEsc(user.name.split(" ")[0])}` : "";
-  return (
-    `💰 *Fin AI*${nome}!\n\n` +
-    `Manda um lançamento em linguagem natural, tipo:\n` +
-    `\`gastei 45 no posto no nubank\`\n` +
-    `\`recebi 3200 de salário no itau\`\n\n` +
-    `Ou escolhe uma opção abaixo 👇`
-  );
-}
-
-function mainMenuKb(user: DbUser): InlineKeyboard {
-  const kb = new InlineKeyboard()
-    .text("💼 Saldo", "m:saldo")
-    .text("⚡ Resumo", "m:resumo")
-    .row()
-    .text("📊 Relatório", "m:relatorio")
-    .text("🍩 Categorias", "m:categorias")
-    .row()
-    .text("📅 Hoje", "m:hoje")
-    .text("🧾 Extrato", "m:extrato")
-    .row()
-    .text("🏦 Contas", "m:contas")
-    .text("➕ Nova conta", "m:novaconta")
-    .row()
-    .text("📲 Meu atalho", "m:atalho")
-    .text("❓ Comandos", "m:help");
-  if (isOwner(user)) kb.row().text("👥 Pessoas", "m:pessoas");
-  return kb;
-}
-
-async function sendMenu(ctx: Ctx, user: DbUser) {
-  await ctx.reply(menuText(user), {
-    parse_mode: "Markdown",
-    reply_markup: mainMenuKb(user),
-  });
-}
-
-async function sendHelp(ctx: Ctx, user: DbUser) {
-  const linhas = [
-    "💰 *Fin AI* — guia de comandos",
-    "",
-    "✍️ *Lançar* (texto livre):",
-    "`gastei 45 no posto no nubank`",
-    "`recebi 3200 de salário no itau`",
-    "",
-    "📊 *Relatórios*",
-    "/relatorio `[hoje|semana|mes|AAAA-MM]` — relatório visual (HTML + link)",
-    "/planilha `[período]` — exporta Excel (.xlsx)",
-    "/resumo `[período]` — resumo rápido",
-    "/categorias `[período]` — gastos por categoria",
-    "/hoje — lançamentos de hoje",
-    "/extrato `[n]` — últimos lançamentos",
-    "",
-    "🏦 *Contas*",
-    "/saldo · /contas · /addconta `Nome | tipo | moeda | saldoInicial`",
-    "",
-    "📲 *Integração*",
-    "/atalho — sua chave e link pro Atalho do iOS",
-    "",
-    "🛠 *Outros*",
-    "/menu — menu com botões",
-    "/desfazer — apaga o último lançamento",
-  ];
-  if (isOwner(user)) {
-    linhas.push(
-      "",
-      "👑 *Dono*",
-      "/pessoas — quem tem acesso",
-      "/convidar `<id> <nome>` — libera alguém",
-      "/remover `<id>` — bloqueia alguém",
-    );
-  }
-  await ctx.reply(linhas.join("\n"), {
-    parse_mode: "Markdown",
-    reply_markup: new InlineKeyboard().text("⬅️ Voltar ao menu", "m:home"),
-  });
-}
-
-// -------------------- Helpers --------------------
-
-function isOwner(user: DbUser): boolean {
-  return user.role === "owner";
-}
-
-/** Escapa caracteres especiais do Markdown legado do Telegram em texto dinâmico. */
-function mdEsc(s: string): string {
-  return String(s ?? "").replace(/([_*`\[])/g, "\\$1");
-}
-
-/** Link do relatório HTML hospedado, autenticado pela chave pessoal do usuário. */
-function reportUrl(user: DbUser, period?: string): string | null {
-  const base = process.env.APP_URL;
-  if (!base) return null;
-  const q = new URLSearchParams({ k: user.shortcutKey });
-  const p = (period || "").trim();
-  if (p) q.set("period", p);
-  return `${base.replace(/\/$/, "")}/api/report?${q.toString()}`;
-}
-
-/** Cabeçalho de KPIs em Markdown, reutilizado por /resumo e /hoje. */
-function resumoHeader(d: ReportData): string {
-  const icon = d.resultado >= 0 ? "📈" : "📉";
-  return (
-    `📊 *${mdEsc(d.periodo)}*\n` +
-    `🟢 Entradas: ${fmtBRL(d.totalEntradas)}\n` +
-    `🔴 Saídas: ${fmtBRL(d.totalSaidas)}\n` +
-    `${icon} Resultado: *${fmtBRL(d.resultado)}*`
-  );
-}
-
-/** Legenda (caption) enviada junto aos documentos de relatório — texto puro. */
-function reportCaption(d: ReportData, resumo?: string): string {
+function reportCaption(d: import("./report.js").ReportData, resumo?: string): string {
   const icon = d.resultado >= 0 ? "📈" : "📉";
   let cap =
     `📊 Relatório — ${d.periodo}\n` +
@@ -746,34 +787,50 @@ function reportCaption(d: ReportData, resumo?: string): string {
     const r = resumo.trim();
     cap += `\n\n🧠 ${r.length > 320 ? r.slice(0, 317) + "…" : r}`;
   }
-  return cap;
+  return cap; // caption vai SEM parse_mode (texto puro)
 }
 
-/** Mini barra de progresso em blocos unicode (0–100%). */
-function textBar(pct: number): string {
-  const n = Math.max(0, Math.min(10, Math.round(pct / 10)));
-  return "▓".repeat(n) + "░".repeat(10 - n);
+// -------------------- Dispatch helpers --------------------
+
+async function replyView(ctx: Ctx, view: View) {
+  await ctx.reply(view.text, { ...HTML, reply_markup: view.kb });
 }
 
-function emoji(tipo: string) {
-  return tipo === "entrada" ? "🟢 Entrada" : "🔴 Saída";
+/** Edita a mensagem atual para a nova view; usado nos callbacks de menu. */
+async function editView(ctx: Ctx, view: View) {
+  await ctx.answerCallbackQuery();
+  await editText(ctx, view);
 }
 
-function confirmText(p: PendingPayload, contaNome: string) {
-  return (
-    `${emoji(p.tipo)} *${fmtBRL(p.valor, p.moeda)}*\n` +
-    `Conta: ${mdEsc(contaNome)}\n` +
-    `Categoria: ${mdEsc(p.categoria)}\n` +
-    `_${mdEsc(p.descricao)}_\n\nConfirmar?`
-  );
+async function editText(ctx: Ctx, view: View) {
+  try {
+    await ctx.editMessageText(view.text, { ...HTML, reply_markup: view.kb });
+  } catch (e) {
+    // "message is not modified" e afins: não são erro real pro usuário.
+    if (e instanceof GrammyError && e.error_code === 400) return;
+    throw e;
+  }
 }
 
-function confirmKb(pendingId: string) {
-  return new InlineKeyboard()
-    .text("✅ Confirmar", `ok:${pendingId}`)
-    .text("❌ Cancelar", `no:${pendingId}`);
+function expired(ctx: Ctx) {
+  return ctx
+    .answerCallbackQuery("⌛ Expirou — manda o lançamento de novo.")
+    .then(() => editText(ctx, { text: "⌛ Este lançamento expirou. Manda de novo? 🙂" }))
+    .catch(() => {});
 }
 
-bot.catch((err) => {
+// -------------------- Erros --------------------
+
+bot.catch(async (err) => {
   console.error("Bot error:", err);
+  try {
+    const ctx = err.ctx;
+    if (ctx?.callbackQuery) {
+      await ctx.answerCallbackQuery("😵 Algo deu errado. Tenta de novo?");
+    } else if (ctx?.chat) {
+      await ctx.reply("😵 Algo deu errado do meu lado. Tenta de novo?");
+    }
+  } catch {
+    // evita loop de erro
+  }
 });

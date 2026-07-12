@@ -94,6 +94,18 @@ export async function listUsers(): Promise<User[]> {
   return prisma.user.findMany({ orderBy: { createdAt: "asc" } });
 }
 
+/** Usuários + contagem de contas em 2 queries fixas (era 1+N no /pessoas). */
+export async function listUsersWithAccountCounts(): Promise<
+  (User & { accountCount: number })[]
+> {
+  const [users, counts] = await Promise.all([
+    prisma.user.findMany({ orderBy: { createdAt: "asc" } }),
+    prisma.account.groupBy({ by: ["userId"], _count: { _all: true } }),
+  ]);
+  const byUser = new Map(counts.map((c) => [c.userId, c._count._all]));
+  return users.map((u) => ({ ...u, accountCount: byUser.get(u.id) ?? 0 }));
+}
+
 /** Usuário dono da requisição do Atalho: chave global (compat) = dono; senão por chave pessoal. */
 export async function resolveUserForShortcut(
   apiKey: string,

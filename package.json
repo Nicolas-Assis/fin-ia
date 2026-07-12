@@ -11,12 +11,16 @@
     "db:studio": "prisma studio",
     "seed": "tsx scripts/seed.ts",
     "set-webhook": "tsx scripts/set-webhook.ts",
+    "check-helpers": "tsx scripts/check-helpers.ts",
+    "normalize-categories": "tsx scripts/normalize-categories.ts",
+    "typecheck": "tsc --noEmit",
     "dev": "vercel dev"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
     "@prisma/adapter-neon": "^6.19.3",
     "@prisma/client": "^6.19.3",
+    "@resvg/resvg-wasm": "^2.6.2",
     "exceljs": "^4.4.0",
     "grammy": "^1.30.0",
     "hono": "^4.6.14"

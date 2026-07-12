@@ -1,14 +1,22 @@
 import ExcelJS from "exceljs";
 import { prisma } from "./db.js";
-import { balances, listAccounts } from "./transactions.js";
+import { balances } from "./transactions.js";
+import { dayKeyTz, resolvePeriod } from "./dates.js";
+import { decToCents } from "./money.js";
 
 const MONEY_FMT = '"R$" #,##0.00;[Red]-"R$" #,##0.00';
 
-/** Dados agregados de um período — base para o .xlsx e para o relatório HTML. */
+/**
+ * Dados agregados de um período — base para o .xlsx, o relatório HTML, o
+ * /resumo e o Q&A. Valores expostos em REAIS (number), mas toda a acumulação
+ * interna é feita em centavos inteiros para não somar floats.
+ * KPIs de fluxo (totais, categorias, daily, topGastos) consideram apenas a
+ * `moedaPrincipal`; moedas extras aparecem em `porMoeda`/`saldoPorMoeda`.
+ */
 export interface ReportData {
-  owner: string; // nome da pessoa dona do relatório
+  owner: string;
   from: Date;
-  to: Date;
+  to: Date; // último instante DENTRO do período (exibição)
   periodo: string;
   totalEntradas: number;
   totalSaidas: number;
@@ -18,7 +26,10 @@ export interface ReportData {
   countTx: number;
   ticketMedioSaida: number;
   maiorGasto: number;
-  taxaPoupanca: number; // % do que entrou que sobrou
+  taxaPoupanca: number;
+  moedaPrincipal: string;
+  porMoeda: { currency: string; entradas: number; saidas: number; resultado: number }[];
+  saldoPorMoeda: { currency: string; total: number }[];
   porCategoria: { categoria: string; total: number; pct: number; count: number }[];
   porConta: { name: string; entrada: number; saida: number }[];
   saldos: { name: string; currency: string; balance: number; type: string }[];
@@ -35,6 +46,7 @@ export interface ReportData {
     data: Date;
     tipo: string;
     valor: number;
+    moeda: string;
     conta: string;
     categoria: string;
     descricao: string;
@@ -48,99 +60,84 @@ export interface ReportResult {
   stats: ReportData;
 }
 
-/** Resolve o intervalo a partir de um argumento: "mes" | "semana" | "hoje" | "YYYY-MM" | vazio */
-export function resolvePeriod(arg?: string): { from: Date; to: Date; label: string } {
-  const now = new Date();
-  const a = (arg || "").trim().toLowerCase();
-
-  if (/^\d{4}-\d{2}$/.test(a)) {
-    const [y, m] = a.split("-").map(Number);
-    const from = new Date(y, m - 1, 1);
-    const to = new Date(y, m, 0, 23, 59, 59);
-    return { from, to, label: a };
-  }
-  if (a === "hoje") {
-    const from = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const to = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
-    return { from, to, label: "hoje" };
-  }
-  if (a === "semana") {
-    const from = new Date(now);
-    from.setDate(now.getDate() - 7);
-    return { from, to: now, label: "últimos 7 dias" };
-  }
-  // padrão: mês corrente
-  const from = new Date(now.getFullYear(), now.getMonth(), 1);
-  const to = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
-  const label = now.toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
-  return { from, to, label };
-}
-
-function dayKey(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
-}
-
 /** Coleta e agrega tudo que os relatórios precisam (escopo: um usuário). */
 export async function collectReportData(
   userId: string,
   userName: string,
   arg?: string,
 ): Promise<ReportData> {
-  const { from, to, label } = resolvePeriod(arg);
+  const { from, toExclusive, label } = resolvePeriod(arg);
 
-  const [txs, accs, saldosRaw] = await Promise.all([
+  const [txs, saldosRows] = await Promise.all([
     prisma.transaction.findMany({
-      where: { occurredAt: { gte: from, lte: to }, account: { userId } },
+      where: { occurredAt: { gte: from, lt: toExclusive }, account: { userId } },
       include: { account: true },
       orderBy: { occurredAt: "asc" },
     }),
-    listAccounts(userId),
     balances(userId),
   ]);
 
-  const typeByName = new Map(accs.map((a) => [a.name, a.type]));
+  // Moeda principal = a com mais lançamentos no período; sem lançamentos, a da
+  // primeira conta; sem contas, BRL.
+  const txCountByCurrency = new Map<string, number>();
+  for (const t of txs) {
+    const cur = t.currency || t.account.currency || "BRL";
+    txCountByCurrency.set(cur, (txCountByCurrency.get(cur) ?? 0) + 1);
+  }
+  const moedaPrincipal =
+    [...txCountByCurrency.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ||
+    saldosRows[0]?.currency ||
+    "BRL";
 
-  let totalEntradas = 0;
-  let totalSaidas = 0;
+  let totalEntradasC = 0;
+  let totalSaidasC = 0;
   let countEntradas = 0;
   let countSaidas = 0;
-  let maiorGasto = 0;
-  const porCatMap = new Map<string, { total: number; count: number }>();
-  const porContaMap = new Map<string, { entrada: number; saida: number }>();
-  const dailyMap = new Map<string, { entrada: number; saida: number }>();
+  let maiorGastoC = 0;
+  const porCatMap = new Map<string, { totalC: number; count: number }>();
+  const porContaMap = new Map<string, { entradaC: number; saidaC: number }>();
+  const dailyMap = new Map<string, { entradaC: number; saidaC: number }>();
+  const porMoedaMap = new Map<string, { entradasC: number; saidasC: number }>();
 
   const txsMapped = txs.map((t) => {
-    const val = Number(t.amount);
-    const key = dayKey(t.occurredAt);
-    const dd = dailyMap.get(key) ?? { entrada: 0, saida: 0 };
-    const pc = porContaMap.get(t.account.name) ?? { entrada: 0, saida: 0 };
+    const cents = decToCents(t.amount);
+    const moeda = t.currency || t.account.currency || "BRL";
 
-    if (t.type === "entrada") {
-      totalEntradas += val;
-      countEntradas++;
-      dd.entrada += val;
-      pc.entrada += val;
-    } else {
-      totalSaidas += val;
-      countSaidas++;
-      maiorGasto = Math.max(maiorGasto, val);
-      dd.saida += val;
-      pc.saida += val;
-      const cat = porCatMap.get(t.category) ?? { total: 0, count: 0 };
-      cat.total += val;
-      cat.count++;
-      porCatMap.set(t.category, cat);
+    const pm = porMoedaMap.get(moeda) ?? { entradasC: 0, saidasC: 0 };
+    if (t.type === "entrada") pm.entradasC += cents;
+    else pm.saidasC += cents;
+    porMoedaMap.set(moeda, pm);
+
+    // KPIs/séries: só a moeda principal (somar USD com BRL não faz sentido).
+    if (moeda === moedaPrincipal) {
+      const key = dayKeyTz(t.occurredAt);
+      const dd = dailyMap.get(key) ?? { entradaC: 0, saidaC: 0 };
+      const pc = porContaMap.get(t.account.name) ?? { entradaC: 0, saidaC: 0 };
+      if (t.type === "entrada") {
+        totalEntradasC += cents;
+        countEntradas++;
+        dd.entradaC += cents;
+        pc.entradaC += cents;
+      } else {
+        totalSaidasC += cents;
+        countSaidas++;
+        maiorGastoC = Math.max(maiorGastoC, cents);
+        dd.saidaC += cents;
+        pc.saidaC += cents;
+        const cat = porCatMap.get(t.category) ?? { totalC: 0, count: 0 };
+        cat.totalC += cents;
+        cat.count++;
+        porCatMap.set(t.category, cat);
+      }
+      dailyMap.set(key, dd);
+      porContaMap.set(t.account.name, pc);
     }
-    dailyMap.set(key, dd);
-    porContaMap.set(t.account.name, pc);
 
     return {
       data: t.occurredAt,
       tipo: t.type,
-      valor: val,
+      valor: cents / 100,
+      moeda,
       conta: t.account.name,
       categoria: t.category,
       descricao: t.description,
@@ -151,30 +148,31 @@ export async function collectReportData(
   const porCategoria = [...porCatMap.entries()]
     .map(([categoria, v]) => ({
       categoria,
-      total: v.total,
+      total: v.totalC / 100,
       count: v.count,
-      pct: totalSaidas > 0 ? (v.total / totalSaidas) * 100 : 0,
+      pct: totalSaidasC > 0 ? (v.totalC / totalSaidasC) * 100 : 0,
     }))
     .sort((x, y) => y.total - x.total);
 
   const porConta = [...porContaMap.entries()]
-    .map(([name, v]) => ({ name, entrada: v.entrada, saida: v.saida }))
+    .map(([name, v]) => ({ name, entrada: v.entradaC / 100, saida: v.saidaC / 100 }))
     .sort((x, y) => y.saida - x.saida);
 
-  // Série diária contínua (preenche dias sem lançamento) — limitada para não explodir o SVG.
+  // Série diária contínua no fuso local. `from` é meia-noite local; somar 24h
+  // mantém o mesmo horário local (America/Sao_Paulo não tem DST desde 2019).
   const daily: { date: string; entrada: number; saida: number }[] = [];
-  const dayMs = 86400000;
-  let cur = new Date(from.getFullYear(), from.getMonth(), from.getDate());
-  const end = new Date(to.getFullYear(), to.getMonth(), to.getDate());
-  while (cur <= end && daily.length < 120) {
-    const key = dayKey(cur);
-    const v = dailyMap.get(key) ?? { entrada: 0, saida: 0 };
-    daily.push({ date: key, entrada: v.entrada, saida: v.saida });
-    cur = new Date(cur.getTime() + dayMs);
+  for (
+    let t = from.getTime();
+    t < toExclusive.getTime() && daily.length < 120;
+    t += 86_400_000
+  ) {
+    const key = dayKeyTz(new Date(t));
+    const v = dailyMap.get(key) ?? { entradaC: 0, saidaC: 0 };
+    daily.push({ date: key, entrada: v.entradaC / 100, saida: v.saidaC / 100 });
   }
 
   const topGastos = txsMapped
-    .filter((t) => t.tipo === "saida")
+    .filter((t) => t.tipo === "saida" && t.moeda === moedaPrincipal)
     .sort((a, b) => b.valor - a.valor)
     .slice(0, 8)
     .map((t) => ({
@@ -185,33 +183,55 @@ export async function collectReportData(
       data: t.data,
     }));
 
-  const saldos = saldosRaw.map((s) => ({
+  const saldos = saldosRows.map((s) => ({
     name: s.name,
     currency: s.currency,
-    balance: s.balance,
-    type: typeByName.get(s.name) || "corrente",
+    balance: s.balanceCents / 100,
+    type: s.type,
   }));
 
-  const resultado = totalEntradas - totalSaidas;
+  const saldoPorMoedaMap = new Map<string, number>();
+  for (const s of saldosRows) {
+    saldoPorMoedaMap.set(
+      s.currency,
+      (saldoPorMoedaMap.get(s.currency) ?? 0) + s.balanceCents,
+    );
+  }
+  const saldoPorMoeda = [...saldoPorMoedaMap.entries()].map(
+    ([currency, cents]) => ({ currency, total: cents / 100 }),
+  );
+
+  const porMoeda = [...porMoedaMap.entries()].map(([currency, v]) => ({
+    currency,
+    entradas: v.entradasC / 100,
+    saidas: v.saidasC / 100,
+    resultado: (v.entradasC - v.saidasC) / 100,
+  }));
+
+  const resultadoC = totalEntradasC - totalSaidasC;
 
   return {
     owner: userName,
     from,
-    to,
+    to: new Date(toExclusive.getTime() - 1000),
     periodo: label,
-    totalEntradas,
-    totalSaidas,
-    resultado,
+    totalEntradas: totalEntradasC / 100,
+    totalSaidas: totalSaidasC / 100,
+    resultado: resultadoC / 100,
     countEntradas,
     countSaidas,
     countTx: txsMapped.length,
-    ticketMedioSaida: countSaidas > 0 ? totalSaidas / countSaidas : 0,
-    maiorGasto,
-    taxaPoupanca: totalEntradas > 0 ? (resultado / totalEntradas) * 100 : 0,
+    ticketMedioSaida: countSaidas > 0 ? totalSaidasC / countSaidas / 100 : 0,
+    maiorGasto: maiorGastoC / 100,
+    taxaPoupanca: totalEntradasC > 0 ? (resultadoC / totalEntradasC) * 100 : 0,
+    moedaPrincipal,
+    porMoeda,
+    saldoPorMoeda,
     porCategoria,
     porConta,
     saldos,
-    saldoTotal: saldos.reduce((s, r) => s + r.balance, 0),
+    saldoTotal:
+      (saldoPorMoedaMap.get(moedaPrincipal) ?? 0) / 100,
     daily,
     topGastos,
     txs: txsMapped,
@@ -238,6 +258,7 @@ export async function buildReport(
     { header: "Data", key: "data", width: 18 },
     { header: "Tipo", key: "tipo", width: 10 },
     { header: "Valor", key: "valor", width: 14 },
+    { header: "Moeda", key: "moeda", width: 8 },
     { header: "Conta", key: "conta", width: 18 },
     { header: "Categoria", key: "categoria", width: 18 },
     { header: "Descrição", key: "descricao", width: 34 },
@@ -250,6 +271,7 @@ export async function buildReport(
       data: t.data,
       tipo: t.tipo,
       valor: t.tipo === "saida" ? -t.valor : t.valor,
+      moeda: t.moeda,
       conta: t.conta,
       categoria: t.categoria,
       descricao: t.descricao,
@@ -274,6 +296,18 @@ export async function buildReport(
   rs.getCell("B4").numFmt = MONEY_FMT;
   rs.getCell("B5").numFmt = MONEY_FMT;
 
+  if (data.porMoeda.length > 1) {
+    rs.addRow({});
+    const moedaHeader = rs.addRow({ k: "Por moeda (entradas − saídas)", v: "" });
+    moedaHeader.font = { bold: true };
+    for (const m of data.porMoeda) {
+      rs.addRow({
+        k: m.currency,
+        v: `${m.entradas.toFixed(2)} − ${m.saidas.toFixed(2)} = ${m.resultado.toFixed(2)}`,
+      });
+    }
+  }
+
   rs.addRow({});
   const catHeader = rs.addRow({ k: "Gastos por categoria", v: "" });
   catHeader.font = { bold: true };
@@ -291,9 +325,7 @@ export async function buildReport(
   }
 
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());
-  const filename = `relatorio-${data.from.toISOString().slice(0, 10)}_a_${data.to
-    .toISOString()
-    .slice(0, 10)}.xlsx`;
+  const filename = `relatorio-${dayKeyTz(data.from)}_a_${dayKeyTz(data.to)}.xlsx`;
 
   return { buffer, filename, stats: data };
 }
